@@ -2024,7 +2024,10 @@ def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
 
 
 def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Return a copy of ``headers`` with internal ``x-headroom-*`` keys stripped.
+    """Return a copy of ``headers`` with internal keys stripped.
+
+    Removes ``x-headroom-*`` keys (subject to the mode below) and, always,
+    ``x-induction-*`` correlation headers.
 
     Used at every upstream call site to prevent fingerprinting / leakage of
     internal flags like ``x-headroom-bypass``, ``x-headroom-mode``,
@@ -2033,13 +2036,17 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     caller's mapping. Pure function. No regex.
 
     When the operator opt-in ``HEADROOM_STRIP_INTERNAL_HEADERS=disabled``
-    is set, returns a shallow copy unchanged. That mode is for diagnostic
-    shadow tracing only and is documented as a per-deploy choice.
+    is set, ``x-headroom-*`` keys are kept but ``x-induction-*`` headers are
+    still removed: they belong to the Induction harness, not to Headroom's
+    own diagnostics. That mode is for diagnostic shadow tracing only and is
+    documented as a per-deploy choice.
     """
+    from headroom.proxy.induction_logger import strip_induction_headers
+
     mode = get_strip_internal_headers_mode()
     if mode == "disabled":
         # Always return a copy so callers can mutate without surprise.
-        return dict(headers)
+        return strip_induction_headers(dict(headers))
     from headroom.proxy.tenant_key import (
         DEFAULT_TENANT_KEY_HEADER,
         TENANT_KEY_HEADER_ENV_VAR,
@@ -2048,7 +2055,9 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     tenant_header = os.environ.get(TENANT_KEY_HEADER_ENV_VAR, DEFAULT_TENANT_KEY_HEADER)
     tenant_header_lower = tenant_header.lower()
     stripped = strip_internal_headers(headers, mode=mode)
-    return {k: v for k, v in stripped.items() if k.lower() != tenant_header_lower}
+    return strip_induction_headers(
+        {k: v for k, v in stripped.items() if k.lower() != tenant_header_lower}
+    )
 
 
 def merge_extra_headers(

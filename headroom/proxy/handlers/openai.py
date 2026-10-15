@@ -5550,6 +5550,20 @@ class OpenAIHandlerMixin:
 
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
+        induction_logger = getattr(self, "induction_logger", None)
+        induction_context = (
+            induction_logger.begin_request(
+                request_id=request_id,
+                client_body=body,
+                provider="openai",
+                model=str(model),
+                module="openai_responses",
+                trajectory_id=request.headers.get("x-induction-trajectory-id"),
+                group_id=request.headers.get("x-induction-group-id"),
+            )
+            if induction_logger is not None
+            else None
+        )
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -6295,6 +6309,7 @@ class OpenAIHandlerMixin:
                     waste_signals=waste_signals_dict,
                     conversation_key=responses_conversation_key,
                     conversation_tokens_saved=tokens_saved,
+                    induction_context=induction_context,
                 )
             else:
 
@@ -6312,6 +6327,7 @@ class OpenAIHandlerMixin:
                         request_id=request_id,
                         forwarder_name="openai_responses",
                         path_for_log=url,
+                        induction_context=induction_context,
                     )
                     _response_body_for_debug: Any = None
                     _response_raw_for_debug: str | None = None
@@ -6396,6 +6412,8 @@ class OpenAIHandlerMixin:
                                     request_id=request_id,
                                     forwarder_name="openai_responses_turn_hook",
                                     path_for_log=url,
+                                    induction_context=induction_context,
+                                    induction_internal=True,
                                 )
                                 _rr_json = _rr.json()
                                 _resp_hook_usage.record(_rr_json, **RESPONSES_USAGE_KEYS)
@@ -6584,6 +6602,8 @@ class OpenAIHandlerMixin:
                                 request_id=request_id,
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
+                                induction_context=induction_context,
+                                induction_internal=True,
                             )
                             return cont_response.json()
 
@@ -6685,7 +6705,15 @@ class OpenAIHandlerMixin:
                                 continuation_body.pop("previous_response_id", None)
 
                                 cont_response = await self._retry_request(
-                                    "POST", url, headers, continuation_body
+                                    "POST",
+                                    url,
+                                    headers,
+                                    continuation_body,
+                                    request_id=request_id,
+                                    forwarder_name="openai_responses_memory_continuation",
+                                    path_for_log=url,
+                                    induction_context=induction_context,
+                                    induction_internal=True,
                                 )
                                 resp_json = cont_response.json()
                                 response = cont_response

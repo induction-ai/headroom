@@ -741,6 +741,15 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--induction-log-file",
+    default=None,
+    envvar="HEADROOM_INDUCTION_LOG_FILE",
+    help=(
+        "Write Induction payload events as JSONL to this path. Off unless set. "
+        "Disabled in --stateless mode. Env: HEADROOM_INDUCTION_LOG_FILE."
+    ),
+)
+@click.option(
     "--codex-wire-debug",
     is_flag=True,
     help="Enable local Codex wire snapshots and matching proxy.log frame traces.",
@@ -1196,6 +1205,7 @@ def proxy(
     compression_max_workers: int | None,
     log_file: str | None,
     log_messages: bool,
+    induction_log_file: str | None,
     codex_wire_debug: bool,
     codex_wire_debug_dir: str | None,
     budget: float | None,
@@ -1563,6 +1573,7 @@ def proxy(
         log_file=None if is_stateless else log_file,
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
+        induction_log_file=None if is_stateless else induction_log_file,
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
         budget_estimated_basis=cast(Literal["count", "ignore", "block"], budget_estimated_basis),

@@ -365,6 +365,8 @@ class ProxyConfig:
     log_requests: bool = True
     log_file: str | None = None
     log_full_messages: bool = False
+    # Fork-only JSONL staging log for Induction payload events; off when None.
+    induction_log_file: str | None = None
 
     # Third-party proxy extensions (opt-in only). List of entry-point names
     # to enable from the `headroom.proxy_extension` group, or `["*"]` for

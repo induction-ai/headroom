@@ -22,6 +22,7 @@ from headroom.proxy.helpers import (
     overload_retry_is_futile,
     retry_after_ms,
 )
+from headroom.proxy.induction_logger import InductionPayloadLogger, strip_induction_headers
 from headroom.proxy.provider_usage import (
     anthropic_cache_ttl_buckets,
     billed_input_for_provider,
@@ -620,7 +621,19 @@ class StreamingMixin:
                 {"role": "assistant", "content": content},
                 {"role": "user", "content": tool_results},
             ]
-            continuation_bytes = json.dumps({**base_body, "messages": messages}).encode("utf-8")
+            continuation_body = {**base_body, "messages": messages}
+            continuation_bytes = json.dumps(continuation_body).encode("utf-8")
+            induction_logger = getattr(self, "induction_logger", None)
+            induction_context = stream_state.get("induction_context")
+            induction_call_id = (
+                induction_logger.log_to(
+                    induction_context,
+                    continuation_body,
+                    internal=True,
+                )
+                if induction_logger is not None and induction_context is not None
+                else None
+            )
             assert self.http_client is not None
             continuation_request = self.http_client.build_request(
                 "POST", url, content=continuation_bytes, headers=headers
@@ -630,6 +643,20 @@ class StreamingMixin:
             async with contextlib.aclosing(continuation) as upstream:
                 if upstream.status_code >= 400:
                     error_bytes = await upstream.aread()
+                    if (
+                        induction_logger is not None
+                        and induction_context is not None
+                        and induction_call_id is not None
+                    ):
+                        induction_logger.log_from(
+                            induction_context,
+                            induction_call_id,
+                            InductionPayloadLogger.payload_from_bytes(
+                                error_bytes,
+                                upstream.headers.get("content-type"),
+                            ),
+                            internal=True,
+                        )
                     logger.warning(
                         f"[{request_id}] Memory: Continuation round {rounds} failed "
                         f"with upstream status {upstream.status_code}"
@@ -660,6 +687,18 @@ class StreamingMixin:
                 if round_bytes is not None
                 else None
             )
+            if (
+                induction_logger is not None
+                and induction_context is not None
+                and induction_call_id is not None
+                and response is not None
+            ):
+                induction_logger.log_from(
+                    induction_context,
+                    induction_call_id,
+                    response,
+                    internal=True,
+                )
             _add_round_usage(stream_state, response)
             logger.info(f"[{request_id}] Memory: Continuation round {rounds} streamed")
 
@@ -1002,6 +1041,25 @@ class StreamingMixin:
         _stream_stop_reason = (
             parsed_response.get("stop_reason") if isinstance(parsed_response, dict) else None
         )
+        induction_logger = getattr(self, "induction_logger", None)
+        induction_context = stream_state.get("induction_context")
+        induction_llm_call_id = stream_state.get("induction_llm_call_id")
+        if (
+            induction_logger is not None
+            and induction_context is not None
+            and induction_llm_call_id is not None
+            and not stream_state.get("induction_from_logged")
+            and full_sse_data
+        ):
+            induction_payload = InductionPayloadLogger.response_from_sse(full_sse_data)
+            if induction_payload is not None:
+                induction_logger.log_from(
+                    induction_context,
+                    induction_llm_call_id,
+                    induction_payload,
+                    internal=bool(stream_state.get("induction_internal")),
+                )
+                stream_state["induction_from_logged"] = True
         outcome = RequestOutcome.from_stream(
             thinking_tokens=_stream_thinking.tokens,
             thinking_inferred=_stream_thinking.inferred,
@@ -1066,6 +1124,8 @@ class StreamingMixin:
         conversation_tokens_saved: int | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
+        induction_context: Any | None = None,
+        induction_internal: bool = False,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1113,6 +1173,8 @@ class StreamingMixin:
                 conversation_tokens_saved=conversation_tokens_saved,
                 server_memory_tool_names=server_memory_tool_names,
                 client_beta=client_beta,
+                induction_context=induction_context,
+                induction_internal=induction_internal,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1147,6 +1209,8 @@ class StreamingMixin:
         conversation_tokens_saved: int | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
         client_beta: str | None = None,
+        induction_context: Any | None = None,
+        induction_internal: bool = False,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1245,7 +1309,7 @@ class StreamingMixin:
             mutation_reasons=list(mutation_reasons or []),
         )
         outbound_bytes, outbound_source = outbound.content, outbound.source
-        outbound_headers = {**headers, "content-type": "application/json"}
+        outbound_headers = strip_induction_headers({**headers, "content-type": "application/json"})
         log_outbound_request(
             forwarder="streaming",
             method="POST",
@@ -1313,6 +1377,10 @@ class StreamingMixin:
                 if urlsplit(url).path.rstrip("/").endswith("/responses")
                 else "chat"
             ),
+            "induction_context": induction_context,
+            "induction_internal": induction_internal,
+            "induction_llm_call_id": None,
+            "induction_from_logged": False,
         }
 
         # Track if we need to handle memory tools
@@ -1321,6 +1389,14 @@ class StreamingMixin:
             and self.memory_handler is not None
             and provider == "anthropic"
         )
+
+        induction_logger = getattr(self, "induction_logger", None)
+        if induction_logger is not None and induction_context is not None:
+            stream_state["induction_llm_call_id"] = induction_logger.log_to(
+                induction_context,
+                InductionPayloadLogger.payload_from_bytes(outbound_bytes, "application/json"),
+                internal=induction_internal,
+            )
 
         # Open connection before generator to capture upstream response headers
         # (needed to forward ratelimit headers to the client via StreamingResponse)
@@ -1557,6 +1633,22 @@ class StreamingMixin:
                 )
 
             stream_state["total_bytes"] = len(error_content)
+            if (
+                induction_logger is not None
+                and induction_context is not None
+                and stream_state.get("induction_llm_call_id") is not None
+                and not stream_state.get("induction_from_logged")
+            ):
+                induction_logger.log_from(
+                    induction_context,
+                    stream_state["induction_llm_call_id"],
+                    InductionPayloadLogger.payload_from_bytes(
+                        error_content,
+                        upstream_response.headers.get("content-type"),
+                    ),
+                    internal=induction_internal,
+                )
+                stream_state["induction_from_logged"] = True
             await self._finalize_stream_response(
                 body=body,
                 provider=provider,
@@ -1707,6 +1799,7 @@ class StreamingMixin:
                         _track_sse = (
                             _codex_wire_debug
                             or memory_enabled
+                            or induction_context is not None
                             or (prefix_tracker is not None and provider == "anthropic")
                         )
                         if _track_sse:

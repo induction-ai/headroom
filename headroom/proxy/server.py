@@ -147,6 +147,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.induction_logger import InductionPayloadLogger, strip_induction_headers
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 from headroom.proxy.malloc_trim import trim_periodically
@@ -1230,6 +1231,9 @@ class HeadroomProxy(
             )
             if config.log_requests
             else None
+        )
+        self.induction_logger = (
+            InductionPayloadLogger(config.induction_log_file) if config.induction_log_file else None
         )
 
         # Enterprise security plugin (loaded dynamically if available + licensed)
@@ -2529,6 +2533,8 @@ class HeadroomProxy(
         forwarder_name: str = "server",
         path_for_log: str | None = None,
         timeout: httpx.Timeout | float | None = None,
+        induction_context: Any | None = None,
+        induction_internal: bool = False,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -2559,7 +2565,7 @@ class HeadroomProxy(
             mutation_reasons=reasons,
         )
         outbound_bytes, source = outbound.content, outbound.source
-        outbound_headers = {**headers, "content-type": "application/json"}
+        outbound_headers = strip_induction_headers({**headers, "content-type": "application/json"})
 
         log_outbound_request(
             forwarder=forwarder_name,
@@ -2572,6 +2578,35 @@ class HeadroomProxy(
             source=source,
             dropped_mutation_reasons=outbound.dropped_mutation_reasons,
         )
+
+        induction_logger = getattr(self, "induction_logger", None)
+        induction_llm_call_id = (
+            induction_logger.log_to(
+                induction_context,
+                InductionPayloadLogger.payload_from_bytes(outbound_bytes, "application/json"),
+                internal=induction_internal,
+            )
+            if induction_logger is not None and induction_context is not None
+            else None
+        )
+
+        def _finish_induction(response: httpx.Response) -> httpx.Response:
+            if (
+                induction_logger is not None
+                and induction_context is not None
+                and induction_llm_call_id is not None
+                and not stream
+            ):
+                induction_logger.log_from(
+                    induction_context,
+                    induction_llm_call_id,
+                    InductionPayloadLogger.payload_from_bytes(
+                        response.content,
+                        response.headers.get("content-type"),
+                    ),
+                    internal=induction_internal,
+                )
+            return response
 
         post_kwargs: dict = {"content": outbound_bytes, "headers": outbound_headers}
         if timeout is not None:
@@ -2603,7 +2638,7 @@ class HeadroomProxy(
                                 retries_left=self.config.retry_max_attempts - attempt - 1,
                             )
                         ):
-                            return response
+                            return _finish_induction(response)
                         delay_ms = retry_after_ms(
                             response, self.config.retry_max_delay_ms
                         ) or jitter_delay_ms(
@@ -2626,7 +2661,7 @@ class HeadroomProxy(
 
                     # Don't retry other client errors (4xx)
                     if 400 <= response.status_code < 500:
-                        return response
+                        return _finish_induction(response)
 
                     # Retry other server errors (5xx)
                     if response.status_code >= 500:
@@ -2636,7 +2671,7 @@ class HeadroomProxy(
                             response=response,
                         )
 
-                    return response
+                    return _finish_induction(response)
 
             # httpx.TransportError covers ConnectError, the timeout family, and —
             # crucially — the protocol errors (Local/RemoteProtocolError, e.g. an
@@ -2656,7 +2691,7 @@ class HeadroomProxy(
                     # never reach here. ConnectError/TimeoutException carry no
                     # response, so those still raise.
                     if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
-                        return e.response
+                        return _finish_induction(e.response)
                     raise
 
                 # Exponential backoff with jitter
@@ -7170,6 +7205,7 @@ if __name__ == "__main__":
         if args.log_file
         else os.environ.get("HEADROOM_LOG_FILE"),
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
+        induction_log_file=os.environ.get("HEADROOM_INDUCTION_LOG_FILE"),
         code_aware_enabled=code_aware_enabled,
         disable_kompress=disable_kompress,
         disable_kompress_fallback=disable_kompress_fallback,
