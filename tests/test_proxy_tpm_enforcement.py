@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
+pytestmark = pytest.mark.skip(reason="This fork never rate-limits; ProxyConfig forces it off.")
+
 
 def test_anthropic_request_over_tpm_is_rejected_before_upstream(monkeypatch) -> None:
     # The first request finds a full bucket and is admitted even though it is

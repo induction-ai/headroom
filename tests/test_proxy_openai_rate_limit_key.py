@@ -24,6 +24,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
+pytestmark = pytest.mark.skip(reason="This fork never rate-limits; ProxyConfig forces it off.")
+
 TOKEN = "hrpt_rate_limit_test_token_0123456789"
 
 CHAT = (

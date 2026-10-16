@@ -597,6 +597,10 @@ class ProxyConfig:
             raise ValueError(
                 "rate_limit_requests_per_minute must be >= 1 when rate_limit_enabled=True"
             )
+        # This fork never rate-limits, so benchmark traffic is never throttled
+        # by Headroom. Forced here, after validation, because every way of
+        # starting a proxy (CLI, env, workers, create_app) builds this config.
+        self.rate_limit_enabled = False
 
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:
