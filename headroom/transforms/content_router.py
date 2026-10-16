@@ -1173,15 +1173,157 @@ _DETECTION_ENVELOPE_RE = re.compile(
 )
 
 
+# Stirrup wraps every tool result in one XML envelope (stirrup 0.2.0:
+# tools/code_backends/base.py format_result, tools/web.py, tools/browser_use.py,
+# core/agent.py). Its tags read as HTML to the detector and as a protected
+# custom-tag block to the mixed compressor, so the payload is detected and
+# compressed on its own and the envelope is reassembled around it byte-exact.
+# Errors and web search/fetch results stay verbatim, as Headroom keeps
+# WebSearch/WebFetch output.
+@dataclass(frozen=True)
+class _StirrupEnvelope:
+    head: str
+    payload: str | None  # None: the whole envelope stays verbatim
+    tail: str
+
+
+_STIRRUP_SHELL_HEAD_RE = re.compile(r"<shell_results>\n<exit_code>-?\d+</exit_code>\n<stdout>")
+_STIRRUP_SHELL_BOUNDARY = "</stdout>\n<stderr>"
+_STIRRUP_SHELL_END = "</stderr>\n</shell_results>"
+_STIRRUP_SNAPSHOT_HEAD = "<page_snapshot>\n"
+_STIRRUP_SNAPSHOT_TAIL = "\n</page_snapshot>"
+_STIRRUP_SUB_AGENT_HEAD = "<sub_agent_result>\n<response>"
+_STIRRUP_SUB_AGENT_TAILS = tuple(
+    f"</response>\n<finished>{finished}</finished>\n</sub_agent_result>"
+    for finished in ("True", "False")
+)
+_STIRRUP_OUTER_TAGS = ("shell_results", "web_fetch", "results", "page_snapshot", "sub_agent_result")
+_STIRRUP_OUTER_TAG_RE = re.compile(f"<({'|'.join(_STIRRUP_OUTER_TAGS)})>")
+_STIRRUP_ELEMENT_RES = {tag: re.compile(f"</?{tag}>") for tag in _STIRRUP_OUTER_TAGS}
+
+
+def _is_single_stirrup_element(text: str, tag: str) -> bool:
+    """True when the ``<tag>`` opening ``text`` is first closed at its very end.
+
+    Nested ``<tag>`` elements balance out; a sibling element, or any text after
+    the first one, closes it early.
+    """
+    depth = 0
+    for marker in _STIRRUP_ELEMENT_RES[tag].finditer(text):
+        if marker.group().startswith("</"):
+            depth -= 1
+        else:
+            depth += 1
+        if depth == 0:
+            return marker.end() == len(text)
+    return False
+
+
+def _is_verbatim_stirrup_envelope(text: str) -> bool:
+    if text.startswith("<shell_results>\n<error_kind>"):
+        return "</error_kind>\n<details>" in text and text.endswith("\n</shell_results>")
+    if text.startswith("<web_fetch><url>"):
+        return text.endswith(("</body></web_fetch>", "</error></web_fetch>"))
+    if text.startswith("<sub_agent_result>\n<error>"):
+        return text.endswith("</error>\n</sub_agent_result>")
+    if text == "<results>\n\n</results>":
+        return True
+    return text.startswith("<results>\n<result>\n<title>") and text.endswith(
+        "\n</result>\n</results>"
+    )
+
+
+def _split_stirrup_envelope(text: str) -> _StirrupEnvelope | None:
+    """Split one whole-string Stirrup tool result around its payload, else ``None``.
+
+    Sibling envelopes, or text before or after one, never match.
+    """
+    outer = _STIRRUP_OUTER_TAG_RE.match(text)
+    if outer is None or not _is_single_stirrup_element(text, outer.group(1)):
+        return None
+    if _is_verbatim_stirrup_envelope(text):
+        return _StirrupEnvelope(head=text, payload=None, tail="")
+    shell_head = _STIRRUP_SHELL_HEAD_RE.match(text)
+    if shell_head is not None and text.endswith(_STIRRUP_SHELL_END):
+        # The first boundary wins: stdout may quote the markers, but stderr must
+        # come back byte-exact.
+        boundary = text.find(_STIRRUP_SHELL_BOUNDARY, shell_head.end())
+        if 0 <= boundary <= len(text) - len(_STIRRUP_SHELL_BOUNDARY) - len(_STIRRUP_SHELL_END):
+            return _StirrupEnvelope(
+                head=text[: shell_head.end()],
+                payload=text[shell_head.end() : boundary],
+                tail=text[boundary:],
+            )
+        return None
+    if (
+        text.startswith(_STIRRUP_SNAPSHOT_HEAD)
+        and text.endswith(_STIRRUP_SNAPSHOT_TAIL)
+        and len(text) >= len(_STIRRUP_SNAPSHOT_HEAD) + len(_STIRRUP_SNAPSHOT_TAIL)
+    ):
+        return _StirrupEnvelope(
+            head=_STIRRUP_SNAPSHOT_HEAD,
+            payload=text[len(_STIRRUP_SNAPSHOT_HEAD) : -len(_STIRRUP_SNAPSHOT_TAIL)],
+            tail=_STIRRUP_SNAPSHOT_TAIL,
+        )
+    if text.startswith(_STIRRUP_SUB_AGENT_HEAD):
+        for tail in _STIRRUP_SUB_AGENT_TAILS:
+            if text.endswith(tail) and len(text) >= len(_STIRRUP_SUB_AGENT_HEAD) + len(tail):
+                return _StirrupEnvelope(
+                    head=_STIRRUP_SUB_AGENT_HEAD,
+                    payload=text[len(_STIRRUP_SUB_AGENT_HEAD) : -len(tail)],
+                    tail=tail,
+                )
+    return None
+
+
+# Splitting a layer rescans everything inside it, so peeling is bounded to keep
+# deeply nested output linear. Stirrup itself nests one or two layers.
+_STIRRUP_MAX_NESTING = 8
+
+
+def _peel_stirrup_envelopes(text: str) -> _StirrupEnvelope | None:
+    """Peel nested whole-string Stirrup envelopes down to one payload, else ``None``.
+
+    The head and tail join every layer's. The payload is ``None`` when the whole
+    string stays verbatim: an error or web result at any layer, a blank payload,
+    or nesting deeper than ``_STIRRUP_MAX_NESTING``.
+    """
+    layer = _split_stirrup_envelope(text)
+    if layer is None:
+        return None
+    heads: list[str] = []
+    tails: list[str] = []
+    payload = text
+    while layer is not None:
+        if layer.payload is None or not layer.payload.strip() or len(heads) == _STIRRUP_MAX_NESTING:
+            return _StirrupEnvelope(head=text, payload=None, tail="")
+        heads.append(layer.head)
+        tails.append(layer.tail)
+        payload = layer.payload
+        layer = _split_stirrup_envelope(payload)
+    return _StirrupEnvelope(head="".join(heads), payload=payload, tail="".join(reversed(tails)))
+
+
+def _strip_stirrup_envelopes(content: str) -> str:
+    """The innermost payload of whole-string Stirrup envelopes, else ``content``."""
+    peeled = _peel_stirrup_envelopes(content)
+    if peeled is None or peeled.payload is None:
+        return content
+    return peeled.payload
+
+
 def _strip_detection_envelope(content: str) -> str:
     """Return the inner payload of a tool-output envelope, for detection only.
 
     Only strips when the ENTIRE string is a single wrapper envelope, so content
     that merely mentions these tags is left untouched. Never returns an empty
-    probe (falls back to the original when the body is blank).
+    probe (falls back to the original when the body is blank). Whole-string
+    Stirrup envelopes are reduced to their innermost payload first, the same
+    content ``ContentRouter.compress`` ends up compressing.
     """
     if "<" not in content:
         return content
+    content = _strip_stirrup_envelopes(content)
     match = _DETECTION_ENVELOPE_RE.match(content)
     if match:
         body = match.group("body")
@@ -2870,6 +3012,16 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
         """
+        stirrup = _peel_stirrup_envelopes(content)
+        if stirrup is not None:
+            return self._compress_stirrup_envelope(
+                stirrup,
+                content,
+                context=context,
+                question=question,
+                bias=bias,
+                precomputed_detection=precomputed_detection,
+            )
         context = context or ""
         debug_enabled = logger.isEnabledFor(logging.DEBUG)
         request_debug = (
@@ -2992,6 +3144,69 @@ class ContentRouter(Transform):
                 original=result.original,
                 compressed=result.compressed,
             )
+        return result
+
+    def _compress_stirrup_envelope(
+        self,
+        envelope: _StirrupEnvelope,
+        content: str,
+        *,
+        context: str,
+        question: str | None,
+        bias: float,
+        precomputed_detection: DetectionResult | None,
+    ) -> RouterCompressionResult:
+        """Compress a peeled Stirrup tool result's payload; the envelopes stay byte-exact.
+
+        ``precomputed_detection`` already describes the payload, because
+        ``_detect_content`` peels the same envelopes.
+        """
+        if envelope.payload is None:
+            return self._stirrup_passthrough(content)
+        inner = self.compress(
+            envelope.payload,
+            context=context,
+            question=question,
+            bias=bias,
+            precomputed_detection=precomputed_detection,
+        )
+        head = envelope.head
+        tail = envelope.tail
+        # The kept envelope counts on both sides of the ratio apply() accepts on.
+        envelope_tokens = _estimate_tokens(head + tail)
+        envelope_decision = RoutingDecision(
+            content_type=ContentType.PLAIN_TEXT,
+            strategy=CompressionStrategy.PASSTHROUGH,
+            original_tokens=envelope_tokens,
+            compressed_tokens=envelope_tokens,
+            section_index=len(inner.routing_log),
+        )
+        result = replace(
+            inner,
+            compressed=head + inner.compressed + tail,
+            original=content,
+            routing_log=[*inner.routing_log, envelope_decision],
+        )
+        # The inner compress() already reported its own decisions.
+        self._observe(replace(result, routing_log=[envelope_decision]))
+        return result
+
+    def _stirrup_passthrough(self, content: str) -> RouterCompressionResult:
+        tokens = _estimate_tokens(content)
+        result = RouterCompressionResult(
+            compressed=content,
+            original=content,
+            strategy_used=CompressionStrategy.PASSTHROUGH,
+            routing_log=[
+                RoutingDecision(
+                    content_type=ContentType.PLAIN_TEXT,
+                    strategy=CompressionStrategy.PASSTHROUGH,
+                    original_tokens=tokens,
+                    compressed_tokens=tokens,
+                )
+            ],
+        )
+        self._observe(result)
         return result
 
     def _observe(self, result: RouterCompressionResult) -> None:
@@ -6390,9 +6605,10 @@ class ContentRouter(Transform):
             # checks but use the lightweight regex detector instead of the
             # full router chain.
             force_kompress = bool(getattr(self, "_runtime_force_kompress", False))
-            detection = (
-                _regex_detect_content_type(content) if force_kompress else _detect_content(content)
-            )
+            if force_kompress:
+                detection = _regex_detect_content_type(_strip_stirrup_envelopes(content))
+            else:
+                detection = _detect_content(content)
             is_code = detection.content_type == ContentType.SOURCE_CODE
 
             # Protection 2: Don't compress recent CODE

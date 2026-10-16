@@ -32,6 +32,7 @@ Coverage:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,34 @@ def test_content_router_records_observer_call_per_routing_decision():
         ("smart_crusher", 200, 50),
         ("code_aware", 300, 300),
     ]
+
+
+_STIRRUP_ROWS = json.dumps(
+    [{"id": i, "name": f"item{i}", "status": "ok", "score": i * 1.5} for i in range(300)],
+    indent=2,
+)
+_STIRRUP_STDERR = "".join(f"warning: deprecated call in module_{i}\n" for i in range(2000))
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "<shell_results>\n<exit_code>0</exit_code>\n<stdout>"
+        f"{_STIRRUP_ROWS}</stdout>\n<stderr>{_STIRRUP_STDERR}</stderr>\n</shell_results>",
+        "<shell_results>\n<error_kind>timeout</error_kind>"
+        f"\n<details>{_STIRRUP_STDERR}</details>\n</shell_results>",
+    ],
+    ids=["compressed_stdout", "verbatim_error"],
+)
+def test_content_router_observer_counts_every_token_of_a_stirrup_result_once(content):
+    spy = SpyObserver()
+    router = ContentRouter(ContentRouterConfig(), observer=spy)
+
+    result = router.compress(content)
+
+    assert sum(call[1] for call in spy.calls) == result.total_original_tokens
+    assert sum(call[2] for call in spy.calls) == result.total_compressed_tokens
+    assert result.total_original_tokens > 0
 
 
 def test_content_router_with_no_observer_is_silent():

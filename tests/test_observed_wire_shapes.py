@@ -586,3 +586,135 @@ def test_read_protection_role_agnostic_openai_role_tool():
     )
     # the role:tool READ observation is protected verbatim (was the bug: unprotected)
     assert out.messages[3]["content"] == code, "role:tool code read must be protected verbatim"
+
+
+# ============================================================================
+# Section 7 — Stirrup's tool-result envelope is handled on every wire shape
+# ============================================================================
+# Stirrup's `code_exec` wraps each result as
+# `<shell_results>\n<exit_code>N</exit_code>\n<stdout>…</stdout>\n<stderr>…</stderr>\n</shell_results>`.
+# The stdout compresses (or stays protected, for a file read) exactly as a bare
+# output would, and the envelope reaches the model byte-exact.
+import json as _stirrup_json
+
+import pytest
+
+_STIRRUP_HEAD = "<shell_results>\n<exit_code>0</exit_code>\n<stdout>"
+_STIRRUP_TAIL = "</stdout>\n<stderr></stderr>\n</shell_results>"
+
+
+def _stirrup_exec_messages(shape: str, cmd: str, output: str) -> list[dict]:
+    if shape == "openai_chat":
+        call = {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "code_exec", "arguments": _stirrup_json.dumps({"cmd": cmd})},
+        }
+        return [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "c1", "content": output},
+        ]
+    return [
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "c1", "name": "code_exec", "input": {"cmd": cmd}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "c1", "content": output}],
+        },
+    ]
+
+
+def _stirrup_tool_output(shape: str, messages: list[dict]) -> str:
+    if shape == "openai_chat":
+        return messages[-1]["content"]
+    return messages[-1]["content"][0]["content"]
+
+
+def _apply_router(messages: list[dict], **config: float) -> list[dict]:
+    from headroom.tokenizers.registry import get_tokenizer
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+    from headroom.transforms.read_lifecycle import ReadLifecycleConfig
+
+    router = ContentRouter(
+        ContentRouterConfig(
+            skip_user_messages=False,
+            read_lifecycle=ReadLifecycleConfig(enabled=False),
+            **config,
+        )
+    )
+    return router.apply(
+        copy.deepcopy(messages),
+        get_tokenizer("gpt-4o"),
+        frozen_message_count=0,
+        context="",
+        compress_user_messages=True,
+        protect_recent=0,
+        min_tokens_to_compress=25,
+    ).messages
+
+
+@pytest.mark.parametrize("shape", ["openai_chat", "anthropic"])
+def test_stirrup_wrapped_output_compresses_on_every_wire_shape(shape, monkeypatch):
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    rows = _stirrup_json.dumps(
+        [{"id": i, "name": f"item{i}", "status": "ok", "score": i * 1.5} for i in range(300)],
+        indent=2,
+    )
+    output = _STIRRUP_HEAD + rows + _STIRRUP_TAIL
+
+    result = _stirrup_tool_output(
+        shape, _apply_router(_stirrup_exec_messages(shape, "python dump.py", output))
+    )
+
+    assert result.startswith(_STIRRUP_HEAD)
+    assert result.endswith(_STIRRUP_TAIL)
+    assert len(result) < len(output)
+
+
+@pytest.mark.parametrize("shape", ["openai_chat", "anthropic"])
+def test_stirrup_wrapped_code_read_stays_verbatim_on_every_wire_shape(shape, monkeypatch):
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    monkeypatch.delenv("HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO", raising=False)
+    output = _STIRRUP_HEAD + "def f():\n" + "    x = 1\n" * 300 + _STIRRUP_TAIL
+
+    result = _stirrup_tool_output(
+        shape, _apply_router(_stirrup_exec_messages(shape, "cat -n a.py", output))
+    )
+
+    assert result == output
+
+
+@pytest.mark.parametrize("shape", ["openai_chat", "anthropic"])
+@pytest.mark.parametrize(
+    "stderr_lines, accepted",
+    [(10, True), (6000, False)],
+    ids=["small_stderr", "stderr_dwarfs_stdout"],
+)
+def test_stirrup_savings_floor_counts_the_kept_stderr(shape, stderr_lines, accepted, monkeypatch):
+    # A savings floor judges the whole tool result: stderr that comes back
+    # verbatim is part of what the model still pays for.
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    rows = _stirrup_json.dumps(
+        [{"id": i, "name": f"item{i}", "status": "ok", "score": i * 1.5} for i in range(300)],
+        indent=2,
+    )
+    stderr = "".join(f"warning: deprecated call in module_{i}\n" for i in range(stderr_lines))
+    output = f"{_STIRRUP_HEAD}{rows}</stdout>\n<stderr>{stderr}</stderr>\n</shell_results>"
+
+    result = _stirrup_tool_output(
+        shape,
+        _apply_router(
+            _stirrup_exec_messages(shape, "python dump.py", output),
+            min_ratio_relaxed=0.85,
+            min_ratio_aggressive=0.85,
+        ),
+    )
+
+    assert (result != output) is accepted

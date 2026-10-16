@@ -1019,6 +1019,43 @@ def test_openai_responses_adapter_compresses_non_excluded_tool_outputs():
     assert units_by_category == {"applied": 1}
 
 
+def test_openai_responses_adapter_compresses_stirrup_wrapped_tool_output():
+    """Stirrup's `code_exec` envelope: the stdout compresses as if bare, the envelope stays."""
+    rows = json.dumps(
+        [{"id": i, "name": f"item{i}", "status": "ok", "score": i * 1.5} for i in range(300)],
+        indent=2,
+    )
+    head = "<shell_results>\n<exit_code>0</exit_code>\n<stdout>"
+    tail = "</stdout>\n<stderr></stderr>\n</shell_results>"
+    handler = _handler_with_router(ContentRouter())
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "code_exec",
+                "arguments": json.dumps({"cmd": "python dump.py"}),
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": head + rows + tail},
+        ],
+    }
+
+    new_payload, modified, saved, _t, _u, _s, _a = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_test",
+        )
+    )
+
+    assert modified is True
+    assert saved > 0
+    assert (
+        new_payload["input"][1]["output"] == head + ContentRouter().compress(rows).compressed + tail
+    )
+
+
 def test_openai_responses_adapter_keeps_small_and_opaque_items():
     router = ContentRouter()
 

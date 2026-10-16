@@ -798,3 +798,67 @@ def test_responses_codex_exec_read_output_forms_are_equivalent(monkeypatch):
     assert whole_modified is False
     assert plain_result["input"][1] == plain_output
     assert whole_result["input"][1] == whole_output
+
+
+def _stirrup_shell(stdout: str) -> str:
+    """What Stirrup's `code_exec` returns for a command that succeeded."""
+    return (
+        f"<shell_results>\n<exit_code>0</exit_code>\n<stdout>{stdout}</stdout>"
+        "\n<stderr></stderr>\n</shell_results>"
+    )
+
+
+def _stirrup_exec(call_id: str, cmd: str, stdout: str) -> list[dict]:
+    return [
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "code_exec",
+            "arguments": json.dumps({"cmd": cmd}),
+        },
+        {"type": "function_call_output", "call_id": call_id, "output": _stirrup_shell(stdout)},
+    ]
+
+
+def test_read_gate_judges_stirrup_envelope_by_its_stdout():
+    """A file read inside Stirrup's envelope gets the verdict of the bare read."""
+    from headroom.transforms.content_router import _read_output_should_be_protected as protect
+
+    data = json.dumps(
+        {
+            "name": "app",
+            "dependencies": [{"name": f"pkg{i}", "version": "1.0.0"} for i in range(30)],
+        },
+        indent=2,
+    )
+    rows = json.dumps([{"id": i, "name": f"item{i}", "status": "ok"} for i in range(200)], indent=2)
+    tiny_rust = 'fn main() {\n    println!("hello {}", 1 + 2);\n}\n'
+    assert protect(_RUST_NL) is True
+    assert protect(data) is False
+    assert protect(rows) is False
+    for stdout in (_RUST_NL, data, rows, tiny_rust):
+        assert protect(_stirrup_shell(stdout)) is protect(stdout)
+
+
+def test_responses_stirrup_code_exec_read_stays_verbatim(monkeypatch):
+    """A `cat` through Stirrup's `code_exec` must reach the model byte-exact."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    items = _stirrup_exec("call_cat", "cat -n src/models.rs", _RUST_NL)
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, {"model": "gpt-5", "input": items})
+
+    assert modified is False
+    assert new_payload["input"][1] == items[1]
+
+
+def test_responses_stirrup_code_exec_test_output_still_compresses(monkeypatch):
+    """Control: a Stirrup `code_exec` running tests is not a read and stays compressible."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    items = _stirrup_exec("call_pytest", "python3 -m pytest -q tests/test_wait.py", _NL_OUTPUT)
+
+    new_payload, modified, _s, _t, _u, _c, _a = _run(handler, {"model": "gpt-5", "input": items})
+
+    assert modified is True
+    assert new_payload["input"][1] != items[1]

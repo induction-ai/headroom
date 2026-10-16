@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -492,6 +493,49 @@ def test_force_kompress_apply_lightweight_detection_protects_recent_code(
         "_detect_content",
         lambda content: (_ for _ in ()).throw(AssertionError("content detection called")),
     )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("recent code should be protected")
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "tool", "content": content}],
+        FakeTokenizer(),
+        force_kompress=True,
+        min_tokens_to_compress=10,
+        protect_recent=2,
+    )
+
+    assert result.messages[0]["content"] == content
+    assert result.transforms_applied == ["router:protected:recent_code"]
+
+
+def test_force_kompress_apply_protects_recent_code_inside_a_stirrup_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTokenizer:
+        def count_text(self, text: str) -> int:
+            return len(text.split())
+
+    router = ContentRouter(ContentRouterConfig(protect_recent_code=2))
+    code = "\n".join(
+        [
+            "def generated_function(value):",
+            "    if value:",
+            "        return str(value)",
+        ]
+        * 40
+    )
+    # Warning-heavy stderr reads as a build log when the whole result is judged.
+    stderr = "".join(f"WARNING: deprecated call in module_{i} (line {i})\n" for i in range(60))
+    content = (
+        f"<shell_results>\n<exit_code>0</exit_code>\n<stdout>{code}</stdout>"
+        f"\n<stderr>{stderr}</stderr>\n</shell_results>"
+    )
+
     monkeypatch.setattr(
         router,
         "compress",
@@ -2344,6 +2388,231 @@ def test_detect_content_sees_through_tool_output_envelope() -> None:
     wrapped = f"<returncode>0</returncode>\n<output>\n{code}\n</output>"
     assert _detect_content(wrapped).content_type is ContentType.SOURCE_CODE
     assert _detect_content(wrapped).content_type is _detect_content(code).content_type
+
+
+# Stirrup's tool-result envelopes that carry a payload, as (head, tail).
+_STIRRUP_PAYLOAD_ENVELOPES = {
+    "shell_results": (
+        "<shell_results>\n<exit_code>0</exit_code>\n<stdout>",
+        "</stdout>\n<stderr></stderr>\n</shell_results>",
+    ),
+    "page_snapshot": ("<page_snapshot>\n", "\n</page_snapshot>"),
+    "sub_agent_result": (
+        "<sub_agent_result>\n<response>",
+        "</response>\n<finished>True</finished>\n</sub_agent_result>",
+    ),
+}
+_STIRRUP_JSON_ROWS = json.dumps(
+    [
+        {"id": i, "name": f"item{i}", "status": "ok" if i % 7 else "failed", "score": i * 1.5}
+        for i in range(300)
+    ],
+    indent=2,
+)
+_STIRRUP_LS_LA = "total 48\n" + "\n".join(
+    f"-rw-r--r--  1 dev  staff  {1000 + i:5d} Oct 15 10:{i:02d} file_{i}.py" for i in range(30)
+)
+_STIRRUP_TINY_RUST = 'fn main() {\n    println!("hello {}", 1 + 2);\n}\n'
+
+
+def _stirrup_shell(stdout: str, *, stderr: str = "", exit_code: int = 0) -> str:
+    return (
+        f"<shell_results>\n<exit_code>{exit_code}</exit_code>\n<stdout>{stdout}</stdout>"
+        f"\n<stderr>{stderr}</stderr>\n</shell_results>"
+    )
+
+
+@pytest.mark.parametrize("envelope", sorted(_STIRRUP_PAYLOAD_ENVELOPES))
+@pytest.mark.parametrize(
+    "payload",
+    [_STIRRUP_LS_LA, "3 files changed\n", _STIRRUP_TINY_RUST, _STIRRUP_JSON_ROWS],
+    ids=["ls_la", "short_output", "tiny_source", "json_rows"],
+)
+def test_detect_content_sees_through_stirrup_envelopes(envelope: str, payload: str) -> None:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES[envelope]
+    assert (
+        _detect_content(head + payload + tail).content_type is _detect_content(payload).content_type
+    )
+
+
+@pytest.mark.parametrize("envelope", sorted(_STIRRUP_PAYLOAD_ENVELOPES))
+def test_stirrup_wrapped_output_compresses_like_bare_output(envelope: str) -> None:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES[envelope]
+    bare = ContentRouter().compress(_STIRRUP_JSON_ROWS)
+    wrapped = ContentRouter().compress(head + _STIRRUP_JSON_ROWS + tail)
+
+    assert len(bare.compressed) < len(_STIRRUP_JSON_ROWS)
+    assert wrapped.compressed == head + bare.compressed + tail
+    assert wrapped.original == head + _STIRRUP_JSON_ROWS + tail
+
+
+def test_nested_stirrup_envelopes_compress_like_their_innermost_payload() -> None:
+    csv = "\n".join(
+        ['"id","name","status","score"'] + [f'"{i}","item{i}","ok","{i * 1.5}"' for i in range(300)]
+    )
+    snapshot_head, snapshot_tail = _STIRRUP_PAYLOAD_ENVELOPES["page_snapshot"]
+    agent_head, agent_tail = _STIRRUP_PAYLOAD_ENVELOPES["sub_agent_result"]
+    nested = agent_head + snapshot_head + csv + snapshot_tail + agent_tail
+
+    # apply() hands compress() the detection it already made for the message.
+    with_detection = ContentRouter().compress(nested, precomputed_detection=_detect_content(nested))
+    bare = ContentRouter().compress(csv)
+
+    assert _detect_content(nested).content_type is _detect_content(csv).content_type
+    assert len(bare.compressed) < len(csv)
+    assert with_detection.compressed == (
+        agent_head + snapshot_head + bare.compressed + snapshot_tail + agent_tail
+    )
+
+
+@pytest.mark.parametrize("depth", [1, content_router_module._STIRRUP_MAX_NESTING])
+def test_nested_stirrup_envelopes_up_to_the_limit_compress_like_their_payload(depth: int) -> None:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES["page_snapshot"]
+    nested = head * depth + _STIRRUP_JSON_ROWS + tail * depth
+
+    result = ContentRouter().compress(nested, precomputed_detection=_detect_content(nested))
+    bare = ContentRouter().compress(_STIRRUP_JSON_ROWS)
+
+    assert result.compressed == head * depth + bare.compressed + tail * depth
+
+
+def test_stirrup_nesting_past_the_limit_stays_verbatim() -> None:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES["page_snapshot"]
+    depth = content_router_module._STIRRUP_MAX_NESTING + 1
+    nested = head * depth + _STIRRUP_JSON_ROWS + tail * depth
+
+    result = ContentRouter().compress(nested, precomputed_detection=_detect_content(nested))
+
+    assert result.compressed == nested
+    assert result.strategy_used is CompressionStrategy.PASSTHROUGH
+
+
+def test_thousands_of_nested_stirrup_envelopes_pass_through_quickly() -> None:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES["page_snapshot"]
+    nested = head * 8000 + "hello" + tail * 8000
+
+    started = time.perf_counter()
+    result = ContentRouter().compress(nested, precomputed_detection=_detect_content(nested))
+    elapsed = time.perf_counter() - started
+
+    assert result.compressed == nested
+    # Unbounded peeling took ~10 s here; bounded peeling is milliseconds.
+    assert elapsed < 2.0
+
+
+def test_stirrup_exit_code_and_stderr_come_back_byte_exact() -> None:
+    stderr = "warning: deprecated flag\n" + _STIRRUP_JSON_ROWS
+    text = _stirrup_shell(_STIRRUP_JSON_ROWS, stderr=stderr, exit_code=2)
+
+    result = ContentRouter().compress(text)
+
+    assert result.compressed.startswith("<shell_results>\n<exit_code>2</exit_code>\n<stdout>")
+    assert result.compressed.endswith(f"</stdout>\n<stderr>{stderr}</stderr>\n</shell_results>")
+    assert len(result.compressed) < len(text)
+
+
+def test_stirrup_stdout_that_quotes_the_markers_keeps_stderr_byte_exact() -> None:
+    stdout = _STIRRUP_JSON_ROWS + "\necho '</stdout>\n<stderr>'\n" + _STIRRUP_JSON_ROWS
+    text = _stirrup_shell(stdout, stderr="real stderr")
+
+    result = ContentRouter().compress(text)
+
+    # Everything from the first marker on is kept, so the real stderr can never
+    # be compressed as if it were stdout.
+    assert result.compressed.endswith(text[text.index("</stdout>\n<stderr>") :])
+    assert result.compressed.startswith("<shell_results>\n<exit_code>0</exit_code>\n<stdout>")
+
+
+def test_stirrup_envelope_with_empty_stdout_passes_through() -> None:
+    text = _stirrup_shell("", stderr="fatal: not a git repository")
+
+    result = ContentRouter().compress(text)
+
+    assert result.compressed == text
+    assert result.strategy_used is CompressionStrategy.PASSTHROUGH
+
+
+_STIRRUP_SEARCH_RESULTS = (
+    "<results>\n"
+    + "\n".join(
+        f"<result>\n<title>Result {i}</title>\n<url>https://example.test/{i}</url>"
+        f"\n<description>{'matching description words ' * 12}</description>\n</result>"
+        for i in range(30)
+    )
+    + "\n</results>"
+)
+
+
+@pytest.mark.parametrize("compress_tagged_content", [False, True])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<shell_results>\n<error_kind>timeout</error_kind>"
+        f"\n<details>{_STIRRUP_JSON_ROWS}</details>\n</shell_results>",
+        "<shell_results>\n<error_kind>invalid_argument</error_kind>"
+        f"\n<details>{_STIRRUP_JSON_ROWS}</details>\n<advice>Quote the path.</advice>"
+        "\n</shell_results>",
+        "<web_fetch><url>https://example.test/page</url>"
+        f"<body>{_STIRRUP_JSON_ROWS}</body></web_fetch>",
+        "<web_fetch><url>https://example.test/page</url>"
+        f"<error>{_STIRRUP_JSON_ROWS}</error></web_fetch>",
+        f"<sub_agent_result>\n<error>{_STIRRUP_JSON_ROWS}</error>\n</sub_agent_result>",
+        _STIRRUP_SEARCH_RESULTS,
+        "<results>\n\n</results>",
+    ],
+    ids=[
+        "shell_error",
+        "shell_error_with_advice",
+        "web_fetch",
+        "web_fetch_error",
+        "sub_agent_error",
+        "web_search",
+        "web_search_empty",
+    ],
+)
+def test_stirrup_error_and_web_envelopes_stay_verbatim(
+    text: str, compress_tagged_content: bool
+) -> None:
+    router = ContentRouter(ContentRouterConfig(compress_tagged_content=compress_tagged_content))
+
+    result = router.compress(text)
+
+    assert result.compressed == text
+    assert result.strategy_used is CompressionStrategy.PASSTHROUGH
+
+
+_STIRRUP_WRAPPED_JSON = _stirrup_shell(_STIRRUP_JSON_ROWS)
+
+
+def _adjacent_stirrup_envelopes(envelope: str) -> str:
+    head, tail = _STIRRUP_PAYLOAD_ENVELOPES[envelope]
+    return f"{head}{_STIRRUP_JSON_ROWS}{tail}\n{head}{_STIRRUP_JSON_ROWS}{tail}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Here is what the command printed:\n" + _STIRRUP_WRAPPED_JSON,
+        _STIRRUP_WRAPPED_JSON + "\nThe command finished.",
+        _STIRRUP_WRAPPED_JSON.removesuffix("\n</shell_results>"),
+        _STIRRUP_WRAPPED_JSON.replace("<exit_code>0</exit_code>", "<exit_code>zero</exit_code>"),
+        _adjacent_stirrup_envelopes("shell_results"),
+        _adjacent_stirrup_envelopes("page_snapshot"),
+        _adjacent_stirrup_envelopes("sub_agent_result"),
+    ],
+    ids=[
+        "text_before",
+        "text_after",
+        "unclosed",
+        "non_numeric_exit_code",
+        "adjacent_shell_results",
+        "adjacent_page_snapshots",
+        "adjacent_sub_agent_results",
+    ],
+)
+def test_text_that_merely_contains_a_stirrup_envelope_is_not_unwrapped(text: str) -> None:
+    assert _strip_detection_envelope(text) == text
+    assert _STIRRUP_JSON_ROWS in ContentRouter().compress(text).compressed
 
 
 def test_detect_content_overrides_html_misroute_for_grep_and_logs(
