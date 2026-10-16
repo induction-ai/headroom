@@ -687,6 +687,44 @@ def test_openai_responses_memory_continuation_is_zdr_safe(store, include, monkey
         assert continuation_body["store"] is store
 
 
+def test_openai_responses_memory_continuation_is_sent_as_a_memory_call(monkeypatch):
+    class _KindRecordingHandler(_ZdrResponsesHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.call_kinds: list[str] = []
+
+        async def _retry_request(self, method: str, url: str, headers: dict, body: dict, **kwargs):
+            # A call that names no kind is the client's own turn.
+            self.call_kinds.append(kwargs.get("induction_call_kind", "main"))
+            return await super()._retry_request(method, url, headers, body, **kwargs)
+
+    request = _build_request(
+        {
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello"}],
+                }
+            ],
+        },
+        {
+            "Authorization": "Bearer sk-test",
+            "User-Agent": "codex-cli/0.5",
+            "x-headroom-user-id": "user-1",
+        },
+    )
+    handler = _KindRecordingHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert response.status_code == 200
+    assert handler.call_kinds == ["main", "memory"]
+
+
 def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):
     request = _build_request(
         {"model": "gpt-4o-mini", "input": "hello"},

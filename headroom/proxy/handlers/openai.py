@@ -6415,7 +6415,7 @@ class OpenAIHandlerMixin:
                                     forwarder_name="openai_responses_turn_hook",
                                     path_for_log=url,
                                     induction_context=induction_context,
-                                    induction_internal=True,
+                                    induction_call_kind="turn_hook",
                                 )
                                 _rr_json = _rr.json()
                                 _resp_hook_usage.record(_rr_json, **RESPONSES_USAGE_KEYS)
@@ -6605,7 +6605,7 @@ class OpenAIHandlerMixin:
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
                                 induction_context=induction_context,
-                                induction_internal=True,
+                                induction_call_kind="ccr",
                             )
                             return cont_response.json()
 
@@ -6715,7 +6715,7 @@ class OpenAIHandlerMixin:
                                     forwarder_name="openai_responses_memory_continuation",
                                     path_for_log=url,
                                     induction_context=induction_context,
-                                    induction_internal=True,
+                                    induction_call_kind="memory",
                                 )
                                 resp_json = cont_response.json()
                                 response = cont_response

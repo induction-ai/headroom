@@ -26,6 +26,7 @@ from headroom.proxy.induction_logger import (
 )
 from headroom.proxy.loopback_guard import require_loopback
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
+from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
 
 _UUID7 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
@@ -34,7 +35,7 @@ def _records(path):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def test_logger_writes_main_and_internal_payload_pairs(tmp_path):
+def test_logger_writes_a_payload_pair_per_upstream_call(tmp_path):
     log_file = tmp_path / "induction.jsonl"
     logger = InductionPayloadLogger(str(log_file))
     context = logger.begin_request(
@@ -47,35 +48,118 @@ def test_logger_writes_main_and_internal_payload_pairs(tmp_path):
 
     main_call_id = logger.log_to(context, {"model": "gpt-test", "input": "compressed"})
     logger.log_from(context, main_call_id, {"id": "resp_1", "output": []})
-    internal_call_id = logger.log_to(
+    resend_call_id = logger.log_to(
         context,
         {"model": "gpt-test", "input": "continuation"},
-        internal=True,
+        kind="ccr",
     )
-    logger.log_from(
-        context,
-        internal_call_id,
-        {"id": "resp_2", "output": []},
-        internal=True,
-    )
+    logger.log_from(context, resend_call_id, {"id": "resp_2", "output": []})
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
         "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
-        "payload_internal_to_llm",
-        "payload_internal_from_llm",
+        "payload_to_llm",
+        "payload_from_llm",
     ]
     expected_hash = "sha256:" + hashlib.sha256('{"a":1,"b":"é"}'.encode()).hexdigest()
     assert {record["client_body_hash"] for record in records} == {expected_hash}
     assert records[1]["llm_call_id"] == records[2]["llm_call_id"] == main_call_id
-    assert records[3]["llm_call_id"] == records[4]["llm_call_id"] == internal_call_id
-    assert main_call_id != internal_call_id
+    assert records[3]["llm_call_id"] == records[4]["llm_call_id"] == resend_call_id
+    assert main_call_id != resend_call_id
     assert all(record["headroom_request_id"] == "hr_1" for record in records)
     assert all(_UUID7.match(record["event_id"]) for record in records)
     assert records[1]["payload"] == {"model": "gpt-test", "input": "compressed"}
     assert records[2]["payload"] == {"id": "resp_1", "output": []}
+
+
+def _turns_by_call(records):
+    turns = {}
+    for record in records:
+        if "llm_call_id" in record:
+            turns.setdefault(record["llm_call_id"], []).append(
+                (record["name"], record["proxy_turn"], record.get("recursion"))
+            )
+    return turns
+
+
+def test_logger_numbers_calls_as_proxy_turns_and_names_why_each_resend_happened(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    logger = InductionPayloadLogger(str(log_file))
+    context = logger.begin_request(
+        request_id="hr_turns",
+        client_body={"model": "gpt-test", "input": "original"},
+        provider="openai",
+        model="gpt-test",
+        module="openai_responses",
+    )
+
+    # Phase 1: the client's turn, then every kind of re-send Headroom makes,
+    # one of them twice.
+    calls = [
+        logger.log_to(context, {"input": "turn"}),
+        logger.log_to(context, {"input": "retrieve"}, kind="ccr"),
+        logger.log_to(context, {"input": "retrieve again"}, kind="ccr"),
+        logger.log_to(context, {"input": "remember"}, kind="memory"),
+        logger.log_to(context, {"input": "re-drive"}, kind="turn_hook"),
+    ]
+    # Phase 2: the replies come back in the opposite order.
+    for call_id in reversed(calls):
+        logger.log_from(context, call_id, {"output": []})
+    logger.log_to_client(context, {"output": []})
+
+    records = _records(log_file)
+    turns = _turns_by_call(records)
+    assert [turns[call_id] for call_id in calls] == [
+        [("payload_to_llm", 0, None), ("payload_from_llm", 0, None)],
+        [("payload_to_llm", 1, "ccr"), ("payload_from_llm", 1, "ccr")],
+        [("payload_to_llm", 2, "ccr"), ("payload_from_llm", 2, "ccr")],
+        [("payload_to_llm", 3, "memory"), ("payload_from_llm", 3, "memory")],
+        [("payload_to_llm", 4, "turn_hook"), ("payload_from_llm", 4, "turn_hook")],
+    ]
+    client_turn = [record for record in records if record.get("llm_call_id") == calls[0]]
+    assert all("recursion" not in record for record in client_turn)
+    client_records = [
+        record
+        for record in records
+        if record["name"] in ("payload_from_client", "payload_to_client")
+    ]
+    assert len(client_records) == 2
+    assert all(
+        "proxy_turn" not in record and "recursion" not in record for record in client_records
+    )
+
+
+def test_proxy_turns_start_over_for_each_request(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    logger = InductionPayloadLogger(str(log_file))
+    first, second = (
+        logger.begin_request(
+            request_id=request_id,
+            client_body={"model": "gpt-test", "input": request_id},
+            provider="openai",
+            model="gpt-test",
+            module="openai_responses",
+        )
+        for request_id in ("hr_first", "hr_second")
+    )
+
+    logger.log_to(first, {"input": "turn"})
+    logger.log_to(first, {"input": "retrieve"}, kind="ccr")
+    logger.log_to(second, {"input": "turn"})
+    logger.log_to(second, {"input": "retrieve"}, kind="ccr")
+
+    records = [record for record in _records(log_file) if "llm_call_id" in record]
+    assert [
+        (record["headroom_request_id"], record["proxy_turn"], record.get("recursion"))
+        for record in records
+    ] == [
+        ("hr_first", 0, None),
+        ("hr_first", 1, "ccr"),
+        ("hr_second", 0, None),
+        ("hr_second", 1, "ccr"),
+    ]
 
 
 def test_logger_records_what_the_client_sent_and_received_outside_any_llm_call(tmp_path):
@@ -128,12 +212,12 @@ def test_logger_stamps_trajectory_and_group_ids_on_every_record(tmp_path):
 
     main_call_id = logger.log_to(context, {"model": "gpt-test", "input": "compressed"})
     logger.log_from(context, main_call_id, {"id": "resp_1", "output": []})
-    internal_call_id = logger.log_to(
+    resend_call_id = logger.log_to(
         context,
         {"model": "gpt-test", "input": "continuation"},
-        internal=True,
+        kind="ccr",
     )
-    logger.log_from(context, internal_call_id, {"id": "resp_2", "output": []}, internal=True)
+    logger.log_from(context, resend_call_id, {"id": "resp_2", "output": []})
     logger.log_to_client(context, {"id": "resp_2", "output": []})
 
     records = _records(log_file)
@@ -141,8 +225,8 @@ def test_logger_stamps_trajectory_and_group_ids_on_every_record(tmp_path):
         "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
-        "payload_internal_to_llm",
-        "payload_internal_from_llm",
+        "payload_to_llm",
+        "payload_from_llm",
         "payload_to_client",
     ]
     assert all(record["trajectory_id"] == "traj_1" for record in records)
@@ -224,7 +308,8 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_buffered_continuation_call_is_logged_as_internal_payload_pair(tmp_path):
+@pytest.mark.parametrize("kind", ["ccr", "memory", "turn_hook"])
+async def test_buffered_resend_is_logged_with_the_reason_headroom_made_it(tmp_path, kind):
     log_file = tmp_path / "induction.jsonl"
     logger = InductionPayloadLogger(str(log_file))
     context = logger.begin_request(
@@ -257,18 +342,19 @@ async def test_buffered_continuation_call_is_logged_as_internal_payload_pair(tmp
         {"model": "gpt-test", "input": "compressed"},
         request_id="hr_2",
         induction_context=context,
-        induction_internal=True,
+        induction_call_kind=kind,
     )
 
     assert result.status_code == 200
     records = [record for record in _records(log_file) if "llm_call_id" in record]
     assert [record["name"] for record in records] == [
-        "payload_internal_to_llm",
-        "payload_internal_from_llm",
+        "payload_to_llm",
+        "payload_from_llm",
     ]
     assert records[0]["payload"] == {"model": "gpt-test", "input": "compressed"}
     assert records[1]["payload"] == {"id": "resp_1", "output": []}
     assert records[0]["llm_call_id"] == records[1]["llm_call_id"]
+    assert records[0]["recursion"] == records[1]["recursion"] == kind
 
 
 def test_streamed_response_payload_is_the_completed_response():
@@ -343,7 +429,7 @@ class _CcrFakeClient:
         )
 
 
-def test_ccr_continuation_is_logged_as_internal_payload_pair(tmp_path, _reset_store):
+def test_ccr_continuation_is_logged_as_the_next_proxy_turn(tmp_path, _reset_store):
     store = get_compression_store()
     original = json.dumps([{"id": i} for i in range(30)])
     hash_key = store.store(original=original, compressed="[]", original_item_count=30)
@@ -399,14 +485,22 @@ def test_ccr_continuation_is_logged_as_internal_payload_pair(tmp_path, _reset_st
         "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
-        "payload_internal_to_llm",
-        "payload_internal_from_llm",
+        "payload_to_llm",
+        "payload_from_llm",
         "payload_to_client",
     ]
     assert records[1]["llm_call_id"] == records[2]["llm_call_id"]
     assert records[3]["llm_call_id"] == records[4]["llm_call_id"]
     assert records[1]["llm_call_id"] != records[3]["llm_call_id"]
     assert records[3]["payload"] == fake.bodies[1]
+    assert [(record.get("proxy_turn"), record.get("recursion")) for record in records] == [
+        (None, None),
+        (0, None),
+        (0, None),
+        (1, "ccr"),
+        (1, "ccr"),
+        (None, None),
+    ]
 
 
 _INDUCTION_HEADERS = {
@@ -570,6 +664,8 @@ def test_streaming_responses_request_stamps_trajectory_ids_and_strips_induction_
     ]
     assert all(record["trajectory_id"] == "traj_1" for record in records)
     assert all(record["group_id"] == "grp_1" for record in records)
+    assert records[1]["proxy_turn"] == records[2]["proxy_turn"] == 0
+    assert "recursion" not in records[1] and "recursion" not in records[2]
 
 
 _COMPLETED_RESPONSE = {
@@ -757,14 +853,72 @@ def test_ccr_turn_logs_the_final_reply_the_client_received(tmp_path, _reset_stor
         "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
-        "payload_internal_to_llm",
-        "payload_internal_from_llm",
+        "payload_to_llm",
+        "payload_from_llm",
         "payload_to_client",
     ]
     client_reply = records[-1]["payload"]
     assert client_reply["id"] == "resp_2"
     assert client_reply["usage"] == {"input_tokens": 60, "output_tokens": 5}
     assert client_reply["output"][0]["content"][0]["text"] == "Resolved"
+
+
+class _RedriveOnce:
+    name = "test_redrive"
+    stream_safe = False
+
+    def __init__(self):
+        self.calls = 0
+
+    def on_request(self, ctx):
+        return None
+
+    async def on_response(self, ctx, response, call_model):
+        if self.calls:
+            return None
+        self.calls += 1
+        return await call_model(ctx.messages)
+
+
+@pytest.fixture
+def _redrive_once_hook():
+    clear_turn_hooks()
+    register_turn_hook(_RedriveOnce())
+    yield
+    clear_turn_hooks()
+
+
+def test_turn_hook_redrive_is_logged_as_the_next_proxy_turn(tmp_path, _redrive_once_hook):
+    log_file = tmp_path / "induction.jsonl"
+    app = _make_induction_app(log_file)
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    fake = _FakeClient(httpx.Response(200, request=request, json=_COMPLETED_RESPONSE))
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = fake
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-test",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert fake.calls == 2
+    records = _records(log_file)
+    assert [
+        (record["name"], record.get("proxy_turn"), record.get("recursion")) for record in records
+    ] == [
+        ("payload_from_client", None, None),
+        ("payload_to_llm", 0, None),
+        ("payload_from_llm", 0, None),
+        ("payload_to_llm", 1, "turn_hook"),
+        ("payload_from_llm", 1, "turn_hook"),
+        ("payload_to_client", None, None),
+    ]
 
 
 def _tapped_app(log_file, respond):

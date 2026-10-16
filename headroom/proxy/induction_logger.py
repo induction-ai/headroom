@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -36,6 +36,10 @@ logger = logging.getLogger("headroom.proxy")
 
 INDUCTION_HEADER_PREFIX = "x-induction-"
 MAX_CLIENT_RESPONSE_LOG_BYTES = 10 * 1024 * 1024
+
+# Why Headroom called the model: the client's own turn, or a re-send after it
+# handled one of the model's tool calls itself.
+CallKind = Literal["main", "ccr", "memory", "turn_hook"]
 
 
 def strip_induction_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -83,13 +87,27 @@ class InductionLogContext:
     trajectory_id: str | None = None
     group_id: str | None = None
     _next_call: int = 1
+    _calls: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def next_llm_call_id(self) -> str:
+    def next_llm_call_id(self, kind: CallKind) -> str:
         with self._lock:
             call_number = self._next_call
             self._next_call += 1
-        return f"{self.request_id}:{call_number}"
+            llm_call_id = f"{self.request_id}:{call_number}"
+            # proxy_turn is our proxy's recursion depth: 0 for the client's
+            # turn, then one per re-send, which also names what it handled.
+            self._calls[llm_call_id] = {
+                "llm_call_id": llm_call_id,
+                "proxy_turn": call_number - 1,
+                **({"recursion": kind} if kind != "main" else {}),
+            }
+        return llm_call_id
+
+    def call_fields(self, llm_call_id: str) -> dict[str, Any]:
+        """The record fields of a call started with :meth:`next_llm_call_id`."""
+        with self._lock:
+            return self._calls[llm_call_id]
 
 
 class InductionPayloadLogger:
@@ -147,12 +165,12 @@ class InductionPayloadLogger:
         context: InductionLogContext,
         payload: Any,
         *,
-        internal: bool = False,
+        kind: CallKind = "main",
     ) -> str:
-        llm_call_id = context.next_llm_call_id()
+        llm_call_id = context.next_llm_call_id(kind)
         self._log_payload(
             context,
-            name="payload_internal_to_llm" if internal else "payload_to_llm",
+            name="payload_to_llm",
             llm_call_id=llm_call_id,
             payload=payload,
         )
@@ -163,12 +181,10 @@ class InductionPayloadLogger:
         context: InductionLogContext,
         llm_call_id: str,
         payload: Any,
-        *,
-        internal: bool = False,
     ) -> None:
         self._log_payload(
             context,
-            name="payload_internal_from_llm" if internal else "payload_from_llm",
+            name="payload_from_llm",
             llm_call_id=llm_call_id,
             payload=payload,
         )
@@ -201,7 +217,7 @@ class InductionPayloadLogger:
             "name": name,
             "event_id": _uuid7(),
             "headroom_request_id": context.request_id,
-            **({"llm_call_id": llm_call_id} if llm_call_id is not None else {}),
+            **(context.call_fields(llm_call_id) if llm_call_id is not None else {}),
             "client_body_hash": context.client_body_hash,
             **({"trajectory_id": context.trajectory_id} if context.trajectory_id else {}),
             **({"group_id": context.group_id} if context.group_id else {}),

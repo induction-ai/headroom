@@ -148,6 +148,7 @@ from headroom.proxy.helpers import (
     retry_after_ms,
 )
 from headroom.proxy.induction_logger import (
+    CallKind,
     InductionPayloadLogger,
     install_client_response_logging,
     strip_induction_headers,
@@ -2538,7 +2539,7 @@ class HeadroomProxy(
         path_for_log: str | None = None,
         timeout: httpx.Timeout | float | None = None,
         induction_context: Any | None = None,
-        induction_internal: bool = False,
+        induction_call_kind: CallKind = "main",
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -2588,7 +2589,7 @@ class HeadroomProxy(
             induction_logger.log_to(
                 induction_context,
                 InductionPayloadLogger.payload_from_bytes(outbound_bytes, "application/json"),
-                internal=induction_internal,
+                kind=induction_call_kind,
             )
             if induction_logger is not None and induction_context is not None
             else None
@@ -2608,7 +2609,6 @@ class HeadroomProxy(
                         response.content,
                         response.headers.get("content-type"),
                     ),
-                    internal=induction_internal,
                 )
             return response
 
