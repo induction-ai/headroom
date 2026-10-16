@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -11,12 +12,18 @@ from unittest.mock import patch
 import httpx
 import pytest
 from click.testing import CliRunner
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
 from headroom.cli.main import main
-from headroom.proxy.induction_logger import InductionPayloadLogger, strip_induction_headers
+from headroom.proxy.induction_logger import (
+    InductionPayloadLogger,
+    install_client_response_logging,
+    strip_induction_headers,
+)
 from headroom.proxy.loopback_guard import require_loopback
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
@@ -54,6 +61,7 @@ def test_logger_writes_main_and_internal_payload_pairs(tmp_path):
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
+        "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
         "payload_internal_to_llm",
@@ -61,13 +69,48 @@ def test_logger_writes_main_and_internal_payload_pairs(tmp_path):
     ]
     expected_hash = "sha256:" + hashlib.sha256('{"a":1,"b":"é"}'.encode()).hexdigest()
     assert {record["client_body_hash"] for record in records} == {expected_hash}
-    assert records[0]["llm_call_id"] == records[1]["llm_call_id"] == main_call_id
-    assert records[2]["llm_call_id"] == records[3]["llm_call_id"] == internal_call_id
+    assert records[1]["llm_call_id"] == records[2]["llm_call_id"] == main_call_id
+    assert records[3]["llm_call_id"] == records[4]["llm_call_id"] == internal_call_id
     assert main_call_id != internal_call_id
     assert all(record["headroom_request_id"] == "hr_1" for record in records)
     assert all(_UUID7.match(record["event_id"]) for record in records)
-    assert records[0]["payload"] == {"model": "gpt-test", "input": "compressed"}
-    assert records[1]["payload"] == {"id": "resp_1", "output": []}
+    assert records[1]["payload"] == {"model": "gpt-test", "input": "compressed"}
+    assert records[2]["payload"] == {"id": "resp_1", "output": []}
+
+
+def test_logger_records_what_the_client_sent_and_received_outside_any_llm_call(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    logger = InductionPayloadLogger(str(log_file))
+    client_body = {"model": "gpt-client", "input": [{"role": "user", "content": "hi"}]}
+    context = logger.begin_request(
+        request_id="hr_client",
+        client_body=client_body,
+        provider="openai",
+        model="gpt-client",
+        module="openai_responses",
+    )
+
+    call_id = logger.log_to(context, {"model": "gpt-client", "input": "compressed"})
+    logger.log_from(context, call_id, {"id": "resp_1", "model": "gpt-upstream", "output": []})
+    logger.log_to_client(context, {"id": "resp_1", "model": "gpt-upstream", "output": []})
+
+    records = _records(log_file)
+    assert [record["name"] for record in records] == [
+        "payload_from_client",
+        "payload_to_llm",
+        "payload_from_llm",
+        "payload_to_client",
+    ]
+    client_in, client_out = records[0], records[3]
+    assert client_in["payload"] == client_body
+    assert client_out["payload"] == {"id": "resp_1", "model": "gpt-upstream", "output": []}
+    assert "llm_call_id" not in client_in
+    assert "llm_call_id" not in client_out
+    assert client_in["model"] == "gpt-client"
+    assert client_out["model"] == "gpt-upstream"
+    assert {record["client_body_hash"] for record in records} == {context.client_body_hash}
+    assert all(record["headroom_request_id"] == "hr_client" for record in records)
+    assert all(_UUID7.match(record["event_id"]) for record in records)
 
 
 def test_logger_stamps_trajectory_and_group_ids_on_every_record(tmp_path):
@@ -91,13 +134,16 @@ def test_logger_stamps_trajectory_and_group_ids_on_every_record(tmp_path):
         internal=True,
     )
     logger.log_from(context, internal_call_id, {"id": "resp_2", "output": []}, internal=True)
+    logger.log_to_client(context, {"id": "resp_2", "output": []})
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
+        "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
         "payload_internal_to_llm",
         "payload_internal_from_llm",
+        "payload_to_client",
     ]
     assert all(record["trajectory_id"] == "traj_1" for record in records)
     assert all(record["group_id"] == "grp_1" for record in records)
@@ -116,9 +162,10 @@ def test_logger_omits_trajectory_ids_when_the_client_did_not_send_them(tmp_path)
 
     call_id = logger.log_to(context, {"model": "gpt-test", "input": "compressed"})
     logger.log_from(context, call_id, {"id": "resp_1", "output": []})
+    logger.log_to_client(context, {"id": "resp_1", "output": []})
 
     records = _records(log_file)
-    assert len(records) == 2
+    assert len(records) == 4
     assert all("trajectory_id" not in record for record in records)
     assert all("group_id" not in record for record in records)
 
@@ -214,7 +261,7 @@ async def test_buffered_continuation_call_is_logged_as_internal_payload_pair(tmp
     )
 
     assert result.status_code == 200
-    records = _records(log_file)
+    records = [record for record in _records(log_file) if "llm_call_id" in record]
     assert [record["name"] for record in records] == [
         "payload_internal_to_llm",
         "payload_internal_from_llm",
@@ -349,15 +396,17 @@ def test_ccr_continuation_is_logged_as_internal_payload_pair(tmp_path, _reset_st
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
+        "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
         "payload_internal_to_llm",
         "payload_internal_from_llm",
+        "payload_to_client",
     ]
-    assert records[0]["llm_call_id"] == records[1]["llm_call_id"]
-    assert records[2]["llm_call_id"] == records[3]["llm_call_id"]
-    assert records[0]["llm_call_id"] != records[2]["llm_call_id"]
-    assert records[2]["payload"] == fake.bodies[1]
+    assert records[1]["llm_call_id"] == records[2]["llm_call_id"]
+    assert records[3]["llm_call_id"] == records[4]["llm_call_id"]
+    assert records[1]["llm_call_id"] != records[3]["llm_call_id"]
+    assert records[3]["payload"] == fake.bodies[1]
 
 
 _INDUCTION_HEADERS = {
@@ -429,8 +478,10 @@ def test_responses_request_stamps_trajectory_ids_and_strips_induction_headers(tm
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
+        "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
+        "payload_to_client",
     ]
     assert all(record["trajectory_id"] == "traj_1" for record in records)
     assert all(record["group_id"] == "grp_1" for record in records)
@@ -445,8 +496,10 @@ class _AsyncSseStream(httpx.AsyncByteStream):
 
 
 class _StreamingFakeClient:
-    def __init__(self, sse: bytes):
+    def __init__(self, sse: bytes, *, status_code=200, content_type="text/event-stream"):
         self._sse = sse
+        self._status_code = status_code
+        self._content_type = content_type
         self.headers_seen = []
 
     async def aclose(self):
@@ -458,8 +511,8 @@ class _StreamingFakeClient:
 
     async def send(self, request, stream=False):
         return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
+            self._status_code,
+            headers={"content-type": self._content_type},
             stream=_AsyncSseStream(self._sse),
             request=request,
         )
@@ -510,8 +563,10 @@ def test_streaming_responses_request_stamps_trajectory_ids_and_strips_induction_
 
     records = _records(log_file)
     assert [record["name"] for record in records] == [
+        "payload_from_client",
         "payload_to_llm",
         "payload_from_llm",
+        "payload_to_client",
     ]
     assert all(record["trajectory_id"] == "traj_1" for record in records)
     assert all(record["group_id"] == "grp_1" for record in records)
@@ -532,6 +587,335 @@ _COMPLETED_RESPONSE = {
 }
 
 
+def _client_records(path):
+    records = _records(path)
+    return (
+        [record for record in records if record["name"] == "payload_from_client"],
+        [record for record in records if record["name"] == "payload_to_client"],
+    )
+
+
+def test_responses_request_logs_what_the_client_sent_and_received(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    app = _make_induction_app(log_file)
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    fake = _FakeClient(httpx.Response(200, request=request, json=_COMPLETED_RESPONSE))
+    first_body = {
+        "model": "gpt-test",
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+    second_body = {**first_body, "input": [{"role": "user", "content": "hello again"}]}
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = fake
+        first = client.post(
+            "/v1/responses",
+            json=first_body,
+            headers={"Authorization": "Bearer test-key", **_INDUCTION_HEADERS},
+        )
+        second = client.post(
+            "/v1/responses",
+            json=second_body,
+            headers={"Authorization": "Bearer test-key", **_INDUCTION_HEADERS},
+        )
+
+    assert first.status_code == second.status_code == 200
+    client_in, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_in] == [first_body, second_body]
+    assert [record["payload"] for record in client_out] == [first.json(), second.json()]
+    assert client_out[0]["payload"]["usage"] == {"input_tokens": 10, "output_tokens": 2}
+    # Each reply is filed under the request it answered.
+    for sent, received in zip(client_in, client_out, strict=True):
+        assert received["headroom_request_id"] == sent["headroom_request_id"]
+        assert received["client_body_hash"] == sent["client_body_hash"]
+        assert received["trajectory_id"] == sent["trajectory_id"] == "traj_1"
+        assert received["group_id"] == sent["group_id"] == "grp_1"
+        assert "llm_call_id" not in sent
+        assert "llm_call_id" not in received
+    assert client_in[0]["headroom_request_id"] != client_in[1]["headroom_request_id"]
+
+
+def test_streaming_responses_request_logs_the_completed_response_the_client_received(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    app = _make_induction_app(log_file)
+    terminal = {"type": "response.completed", "response": _COMPLETED_RESPONSE}
+    fake = _StreamingFakeClient(
+        (
+            'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n'
+            f"event: response.completed\ndata: {json.dumps(terminal)}\n\n"
+        ).encode()
+    )
+    sent = {
+        "model": "gpt-test",
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": True,
+    }
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = fake
+        response = client.post(
+            "/v1/responses",
+            json=sent,
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 200, response.text
+    client_in, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_in] == [sent]
+    assert [record["payload"] for record in client_out] == [_COMPLETED_RESPONSE]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_upstream_error_is_logged_as_the_reply_the_client_received(tmp_path, stream):
+    log_file = tmp_path / "induction.jsonl"
+    app = _make_induction_app(log_file)
+    error_body = {"error": {"message": "bad input", "type": "invalid_request_error"}}
+    if stream:
+        fake = _StreamingFakeClient(
+            json.dumps(error_body).encode(),
+            status_code=400,
+            content_type="application/json",
+        )
+    else:
+        request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+        fake = _FakeClient(httpx.Response(400, request=request, json=error_body))
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = fake
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-test",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 400
+    _, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_out] == [error_body]
+
+
+def _run_buffered_ccr_turn(tmp_path):
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps([{"id": i} for i in range(30)]),
+        compressed="[]",
+        original_item_count=30,
+    )
+    log_file = tmp_path / "induction.jsonl"
+    app = _make_induction_app(log_file)
+    fake = _CcrFakeClient(hash_key)
+    sent = {
+        "model": "gpt-test",
+        "input": [{"role": "user", "content": "get the data"}],
+        "tools": [
+            {
+                "type": "function",
+                "name": CCR_TOOL_NAME,
+                "description": "Retrieve original content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"hash": {"type": "string"}},
+                    "required": ["hash"],
+                },
+            }
+        ],
+        "stream": True,
+    }
+
+    with TestClient(app) as client:
+        app.state.proxy.http_client = fake
+        response = client.post(
+            "/v1/responses",
+            json=sent,
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert len(fake.bodies) == 2
+    return sent, _records(log_file)
+
+
+def test_client_request_is_logged_as_sent_before_the_proxy_rewrites_it(tmp_path, _reset_store):
+    sent, records = _run_buffered_ccr_turn(tmp_path)
+
+    assert records[0]["name"] == "payload_from_client"
+    assert records[0]["payload"] == sent
+    # The proxy asked upstream for a buffered reply so it could resolve the
+    # retrieval itself; the client's own request still says stream.
+    assert records[1]["name"] == "payload_to_llm"
+    assert records[1]["payload"]["stream"] is False
+
+
+def test_ccr_turn_logs_the_final_reply_the_client_received(tmp_path, _reset_store):
+    _, records = _run_buffered_ccr_turn(tmp_path)
+
+    assert [record["name"] for record in records] == [
+        "payload_from_client",
+        "payload_to_llm",
+        "payload_from_llm",
+        "payload_internal_to_llm",
+        "payload_internal_from_llm",
+        "payload_to_client",
+    ]
+    client_reply = records[-1]["payload"]
+    assert client_reply["id"] == "resp_2"
+    assert client_reply["usage"] == {"input_tokens": 60, "output_tokens": 5}
+    assert client_reply["output"][0]["content"][0]["text"] == "Resolved"
+
+
+def _tapped_app(log_file, respond):
+    logger = InductionPayloadLogger(str(log_file))
+    app = FastAPI()
+
+    @app.post("/v1/responses")
+    async def endpoint(request: Request):
+        request.state.induction_context = logger.begin_request(
+            request_id="hr_tap",
+            client_body=await request.json(),
+            provider="openai",
+            model="gpt-test",
+            module="openai_responses",
+        )
+        return respond()
+
+    @app.post("/unlogged")
+    async def unlogged():
+        return respond()
+
+    install_client_response_logging(app, logger)
+    return app
+
+
+def test_request_that_crashes_the_proxy_logs_the_error_reply_the_client_got(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+
+    def crash():
+        raise RuntimeError("handler bug")
+
+    with TestClient(_tapped_app(log_file, crash), raise_server_exceptions=False) as client:
+        response = client.post("/v1/responses", json={"model": "gpt-test"})
+
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    _, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_out] == [{"raw": "Internal Server Error"}]
+
+
+def test_refused_request_logs_the_error_reply_the_client_got(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+
+    def refuse():
+        raise HTTPException(status_code=413, detail={"error": {"type": "compression_refused"}})
+
+    with TestClient(_tapped_app(log_file, refuse)) as client:
+        response = client.post("/v1/responses", json={"model": "gpt-test"})
+
+    assert response.status_code == 413
+    _, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_out] == [response.json()]
+
+
+def test_reply_over_the_size_cap_reaches_the_client_and_is_logged_without_its_payload(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("headroom.proxy.induction_logger.MAX_CLIENT_RESPONSE_LOG_BYTES", 64)
+    log_file = tmp_path / "induction.jsonl"
+    big = {"id": "resp_1", "output": [{"text": "x" * 500}]}
+
+    with TestClient(_tapped_app(log_file, lambda: JSONResponse(big))) as client:
+        response = client.post("/v1/responses", json={"model": "gpt-test"})
+
+    assert response.json() == big
+    _, client_out = _client_records(log_file)
+    assert len(client_out) == 1
+    assert client_out[0]["payload"] is None
+
+
+def test_stream_that_breaks_part_way_logs_what_reached_the_client(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    created = {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
+
+    async def breaking_stream():
+        yield f"event: response.created\ndata: {json.dumps(created)}\n\n".encode()
+        raise RuntimeError("upstream went away")
+
+    def respond():
+        return StreamingResponse(breaking_stream(), media_type="text/event-stream")
+
+    with TestClient(_tapped_app(log_file, respond)) as client:
+        with pytest.raises(RuntimeError, match="upstream went away"):
+            client.post("/v1/responses", json={"model": "gpt-test"})
+
+    _, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_out] == [created["response"]]
+
+
+@pytest.mark.asyncio
+async def test_stream_whose_client_disconnects_logs_only_what_was_delivered(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    created = {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
+    completed = {"type": "response.completed", "response": _COMPLETED_RESPONSE}
+
+    async def full_stream():
+        yield f"event: response.created\ndata: {json.dumps(created)}\n\n".encode()
+        yield f"event: response.completed\ndata: {json.dumps(completed)}\n\n".encode()
+
+    def respond():
+        return StreamingResponse(full_stream(), media_type="text/event-stream")
+
+    app = _tapped_app(log_file, respond)
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b'{"model": "gpt-test"}', "more_body": False}
+        # Like a server, wait for a disconnect message that never comes.
+        await asyncio.Event().wait()
+
+    async def send(message):
+        # The client is gone by the time the completed event goes out.
+        if b"response.completed" in message.get("body", b""):
+            raise OSError("client disconnected")
+
+    with pytest.raises(OSError, match="client disconnected"):
+        await asyncio.wait_for(app(scope, receive, send), timeout=5)
+
+    _, client_out = _client_records(log_file)
+    assert [record["payload"] for record in client_out] == [created["response"]]
+
+
+def test_requests_without_a_log_context_reach_the_client_unlogged(tmp_path):
+    log_file = tmp_path / "induction.jsonl"
+    reply = {"id": "resp_1", "output": []}
+
+    with TestClient(_tapped_app(log_file, lambda: JSONResponse(reply))) as client:
+        response = client.post("/unlogged", json={"model": "gpt-test"})
+
+    assert response.json() == reply
+    assert not log_file.exists()
+
+
 @pytest.fixture
 def _isolated_home_and_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -547,7 +931,15 @@ def _files_with_payload_records(root):
         path
         for path in root.rglob("*")
         if path.is_file()
-        and any(name in path.read_bytes() for name in (b"payload_to_llm", b"payload_from_llm"))
+        and any(
+            name in path.read_bytes()
+            for name in (
+                b"payload_from_client",
+                b"payload_to_llm",
+                b"payload_from_llm",
+                b"payload_to_client",
+            )
+        )
     ]
 
 

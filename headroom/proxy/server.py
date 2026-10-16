@@ -147,7 +147,11 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
-from headroom.proxy.induction_logger import InductionPayloadLogger, strip_induction_headers
+from headroom.proxy.induction_logger import (
+    InductionPayloadLogger,
+    install_client_response_logging,
+    strip_induction_headers,
+)
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host, is_loopback_host_header
 from headroom.proxy.malloc_trim import trim_periodically
@@ -6222,6 +6226,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     _install_gateway_contract(app, config, route_dependencies=_compress_dependencies)
 
     register_provider_routes(app, proxy)
+    if proxy.induction_logger is not None:
+        install_client_response_logging(app, proxy.induction_logger)
     # Register last so this raw ASGI middleware is outermost and covers the
     # complete response body, including responses produced by other middleware.
     app.add_middleware(ActivityMiddleware, proxy=proxy)

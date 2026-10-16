@@ -1,7 +1,8 @@
 """Induction payload-event logging for this Headroom fork.
 
 For each HTTP POST to a Responses endpoint, the proxy writes one staging
-record per upstream request and response payload. The Induction benchmark
+record for the client's request, one per upstream request and response
+payload, and one for what the client received. The Induction benchmark
 harness folds those records into a run's server log. When the client sends
 ``x-induction-trajectory-id`` (and optionally ``x-induction-group-id``),
 each record is stamped with those ids so the harness can attribute payloads
@@ -24,12 +25,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+
 from headroom import fileperms
 
 logger = logging.getLogger("headroom.proxy")
 
 
 INDUCTION_HEADER_PREFIX = "x-induction-"
+MAX_CLIENT_RESPONSE_LOG_BYTES = 10 * 1024 * 1024
 
 
 def strip_induction_headers(headers: Mapping[str, str]) -> dict[str, str]:
@@ -118,7 +124,7 @@ class InductionPayloadLogger:
             body_hash = client_body_hash(client_body)
         except (TypeError, ValueError):
             body_hash = "sha256:" + hashlib.sha256(repr(client_body).encode()).hexdigest()
-        return InductionLogContext(
+        context = InductionLogContext(
             request_id=request_id,
             client_body_hash=body_hash,
             provider=provider,
@@ -127,6 +133,14 @@ class InductionPayloadLogger:
             trajectory_id=trajectory_id or None,
             group_id=group_id or None,
         )
+        # Written now, before any transform edits the body in place.
+        self._log_payload(
+            context,
+            name="payload_from_client",
+            llm_call_id=None,
+            payload=client_body,
+        )
+        return context
 
     def log_to(
         self,
@@ -159,12 +173,20 @@ class InductionPayloadLogger:
             payload=payload,
         )
 
+    def log_to_client(self, context: InductionLogContext, payload: Any) -> None:
+        self._log_payload(
+            context,
+            name="payload_to_client",
+            llm_call_id=None,
+            payload=payload,
+        )
+
     def _log_payload(
         self,
         context: InductionLogContext,
         *,
         name: str,
-        llm_call_id: str,
+        llm_call_id: str | None,
         payload: Any,
     ) -> None:
         if self.log_file is None:
@@ -179,7 +201,7 @@ class InductionPayloadLogger:
             "name": name,
             "event_id": _uuid7(),
             "headroom_request_id": context.request_id,
-            "llm_call_id": llm_call_id,
+            **({"llm_call_id": llm_call_id} if llm_call_id is not None else {}),
             "client_body_hash": context.client_body_hash,
             **({"trajectory_id": context.trajectory_id} if context.trajectory_id else {}),
             **({"group_id": context.group_id} if context.group_id else {}),
@@ -240,3 +262,94 @@ class InductionPayloadLogger:
             elif event.get("type") == "error":
                 fallback = event
         return terminal or fallback
+
+
+class InductionClientResponseMiddleware:
+    """Write ``payload_to_client`` from the bytes the client actually receives.
+
+    The Responses handler has many exits (JSON and SSE replies, re-synthesized
+    CCR streams, error bodies, a 413 raised as an exception), so the record is
+    taken off the wire instead of at each return. Only requests whose handler
+    set ``request.state.induction_context`` are logged.
+    """
+
+    def __init__(self, app: Any, *, induction_logger: InductionPayloadLogger) -> None:
+        self.app = app
+        self.induction_logger = induction_logger
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # The same dict backs the handler's request.state.
+        state = scope.setdefault("state", {})
+        context: InductionLogContext | None = None
+        content_type: str | None = None
+        body: bytearray | None = bytearray()
+        logged = False
+
+        def log_once() -> None:
+            nonlocal logged
+            if context is None or logged:
+                return
+            logged = True
+            try:
+                payload = (
+                    None
+                    if body is None
+                    else InductionPayloadLogger.payload_from_bytes(bytes(body), content_type)
+                )
+                self.induction_logger.log_to_client(context, payload)
+            except Exception:
+                logger.debug("Induction client response logging failed", exc_info=True)
+
+        async def tapped_send(message: Any) -> None:
+            nonlocal context, content_type, body
+            if message["type"] == "http.response.start":
+                # Claimed so the unhandled-error reply cannot log a second
+                # record for a reply that has already started.
+                found = state.pop("induction_context", None)
+                context = found if isinstance(found, InductionLogContext) else None
+                for key, value in message.get("headers", []):
+                    if key.lower() == b"content-type":
+                        content_type = value.decode("latin-1")
+            await send(message)
+            if message["type"] == "http.response.body" and context is not None:
+                if body is not None:
+                    body.extend(message.get("body", b""))
+                    if len(body) > MAX_CLIENT_RESPONSE_LOG_BYTES:
+                        body = None
+                if not message.get("more_body", False):
+                    log_once()
+
+        try:
+            await self.app(scope, receive, tapped_send)
+        finally:
+            # A stream that broke or lost its client part-way still records
+            # what reached the client.
+            log_once()
+
+
+def install_client_response_logging(
+    app: Starlette, induction_logger: InductionPayloadLogger
+) -> None:
+    """Log ``payload_to_client`` for every reply, including unhandled-error 500s.
+
+    Starlette sends the 500 for an unhandled exception from outside every added
+    middleware, so the tap never sees it. The installed handler builds that same
+    default reply itself and logs it, unless a reply had already started.
+    """
+
+    async def reply_to_unhandled_error(request: Request, exc: Exception) -> Response:
+        response = PlainTextResponse("Internal Server Error", status_code=500)
+        context = getattr(request.state, "induction_context", None)
+        if isinstance(context, InductionLogContext):
+            induction_logger.log_to_client(
+                context,
+                InductionPayloadLogger.payload_from_bytes(bytes(response.body), "text/plain"),
+            )
+        return response
+
+    app.add_middleware(InductionClientResponseMiddleware, induction_logger=induction_logger)
+    app.add_exception_handler(Exception, reply_to_unhandled_error)

@@ -5564,6 +5564,8 @@ class OpenAIHandlerMixin:
             if induction_logger is not None
             else None
         )
+        if induction_context is not None:
+            request.state.induction_context = induction_context
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
