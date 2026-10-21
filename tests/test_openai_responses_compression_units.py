@@ -931,7 +931,33 @@ def test_openai_responses_adapter_excludes_tool_case_insensitively():
     assert new_payload == payload
 
 
-def test_openai_responses_adapter_keeps_websearch_output_verbatim():
+_STIRRUP_SEARCH_RESULTS = (
+    "<results>\n"
+    + "\n".join(
+        f"<result>\n<title>Result {i}</title>\n<url>https://example.test/{i}</url>"
+        f"\n<description>{'matching description words ' * 12}</description>\n</result>"
+        for i in range(5)
+    )
+    + "\n</results>"
+)
+
+
+@pytest.mark.parametrize(
+    "name, output",
+    [
+        (
+            "WebSearch",
+            "{\n"
+            '  "results": [\n'
+            '    {"title": "Headroom", "snippet": "structured web payload with spacing that must remain verbatim"}\n'
+            "  ]\n"
+            "}",
+        ),
+        ("web_search", _STIRRUP_SEARCH_RESULTS),
+    ],
+    ids=["claude_code", "stirrup"],
+)
+def test_openai_responses_adapter_keeps_websearch_output_verbatim(name, output):
     """Default-excluded web tools must bypass both lossy and lossless rewrites."""
     router = ContentRouter()
 
@@ -944,17 +970,10 @@ def test_openai_responses_adapter_keeps_websearch_output_verbatim():
 
     router.compress = MethodType(compress, router)
     handler = _handler_with_router(router)
-    output = (
-        "{\n"
-        '  "results": [\n'
-        '    {"title": "Headroom", "snippet": "structured web payload with spacing that must remain verbatim"}\n'
-        "  ]\n"
-        "}"
-    )
     payload = {
         "model": "gpt-5",
         "input": [
-            {"type": "function_call", "call_id": "call_1", "name": "WebSearch", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_1", "name": name, "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_1", "output": output},
         ],
     }
@@ -1019,14 +1038,32 @@ def test_openai_responses_adapter_compresses_non_excluded_tool_outputs():
     assert units_by_category == {"applied": 1}
 
 
-def test_openai_responses_adapter_compresses_stirrup_wrapped_tool_output():
-    """Stirrup's `code_exec` envelope: the stdout compresses as if bare, the envelope stays."""
+@pytest.mark.parametrize(
+    "name, arguments, head, tail",
+    [
+        (
+            "code_exec",
+            {"cmd": "python dump.py"},
+            "<shell_results>\n<exit_code>0</exit_code>\n<stdout>",
+            "</stdout>\n<stderr></stderr>\n</shell_results>",
+        ),
+        (
+            "fetch_web_page",
+            {"url": "https://example.test/items.json"},
+            "<web_fetch><url>https://example.test/items.json</url><body>",
+            "</body></web_fetch>",
+        ),
+    ],
+    ids=["code_exec", "fetch_web_page"],
+)
+def test_openai_responses_adapter_compresses_stirrup_wrapped_tool_output(
+    name, arguments, head, tail
+):
+    """Stirrup's envelope: the payload compresses as if bare, the envelope stays."""
     rows = json.dumps(
         [{"id": i, "name": f"item{i}", "status": "ok", "score": i * 1.5} for i in range(300)],
         indent=2,
     )
-    head = "<shell_results>\n<exit_code>0</exit_code>\n<stdout>"
-    tail = "</stdout>\n<stderr></stderr>\n</shell_results>"
     handler = _handler_with_router(ContentRouter())
     payload = {
         "model": "gpt-5",
@@ -1034,8 +1071,8 @@ def test_openai_responses_adapter_compresses_stirrup_wrapped_tool_output():
             {
                 "type": "function_call",
                 "call_id": "call_1",
-                "name": "code_exec",
-                "arguments": json.dumps({"cmd": "python dump.py"}),
+                "name": name,
+                "arguments": json.dumps(arguments),
             },
             {"type": "function_call_output", "call_id": "call_1", "output": head + rows + tail},
         ],

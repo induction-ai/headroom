@@ -1178,8 +1178,6 @@ _DETECTION_ENVELOPE_RE = re.compile(
 # core/agent.py). Its tags read as HTML to the detector and as a protected
 # custom-tag block to the mixed compressor, so the payload is detected and
 # compressed on its own and the envelope is reassembled around it byte-exact.
-# Errors and web search/fetch results stay verbatim, as Headroom keeps
-# WebSearch/WebFetch output.
 @dataclass(frozen=True)
 class _StirrupEnvelope:
     head: str
@@ -1190,6 +1188,15 @@ class _StirrupEnvelope:
 _STIRRUP_SHELL_HEAD_RE = re.compile(r"<shell_results>\n<exit_code>-?\d+</exit_code>\n<stdout>")
 _STIRRUP_SHELL_BOUNDARY = "</stdout>\n<stderr>"
 _STIRRUP_SHELL_END = "</stderr>\n</shell_results>"
+_STIRRUP_SHELL_ERROR_HEAD_RE = re.compile(
+    r"<shell_results>\n<error_kind>[^<]+</error_kind>\n<details>"
+)
+_STIRRUP_SHELL_ERROR_TAIL = "</details>\n</shell_results>"
+_STIRRUP_SHELL_ADVICE_BOUNDARY = "</details>\n<advice>"
+_STIRRUP_SHELL_ADVICE_END = "</advice>\n</shell_results>"
+_STIRRUP_WEB_FETCH_HEAD_RE = re.compile(r"<web_fetch><url>.*?</url><(body|error)>", re.DOTALL)
+_STIRRUP_SEARCH_HEAD = "<results>\n"
+_STIRRUP_SEARCH_TAIL = "\n</results>"
 _STIRRUP_SNAPSHOT_HEAD = "<page_snapshot>\n"
 _STIRRUP_SNAPSHOT_TAIL = "\n</page_snapshot>"
 _STIRRUP_SUB_AGENT_HEAD = "<sub_agent_result>\n<response>"
@@ -1197,6 +1204,8 @@ _STIRRUP_SUB_AGENT_TAILS = tuple(
     f"</response>\n<finished>{finished}</finished>\n</sub_agent_result>"
     for finished in ("True", "False")
 )
+_STIRRUP_SUB_AGENT_ERROR_HEAD = "<sub_agent_result>\n<error>"
+_STIRRUP_SUB_AGENT_ERROR_TAIL = "</error>\n</sub_agent_result>"
 _STIRRUP_OUTER_TAGS = ("shell_results", "web_fetch", "results", "page_snapshot", "sub_agent_result")
 _STIRRUP_OUTER_TAG_RE = re.compile(f"<({'|'.join(_STIRRUP_OUTER_TAGS)})>")
 _STIRRUP_ELEMENT_RES = {tag: re.compile(f"</?{tag}>") for tag in _STIRRUP_OUTER_TAGS}
@@ -1219,18 +1228,12 @@ def _is_single_stirrup_element(text: str, tag: str) -> bool:
     return False
 
 
-def _is_verbatim_stirrup_envelope(text: str) -> bool:
-    if text.startswith("<shell_results>\n<error_kind>"):
-        return "</error_kind>\n<details>" in text and text.endswith("\n</shell_results>")
-    if text.startswith("<web_fetch><url>"):
-        return text.endswith(("</body></web_fetch>", "</error></web_fetch>"))
-    if text.startswith("<sub_agent_result>\n<error>"):
-        return text.endswith("</error>\n</sub_agent_result>")
-    if text == "<results>\n\n</results>":
-        return True
-    return text.startswith("<results>\n<result>\n<title>") and text.endswith(
-        "\n</result>\n</results>"
-    )
+def _split_between(text: str, head: str, tail: str) -> _StirrupEnvelope | None:
+    if text.startswith(head) and text.endswith(tail) and len(text) >= len(head) + len(tail):
+        return _StirrupEnvelope(
+            head=head, payload=text[len(head) : len(text) - len(tail)], tail=tail
+        )
+    return None
 
 
 def _split_stirrup_envelope(text: str) -> _StirrupEnvelope | None:
@@ -1241,8 +1244,6 @@ def _split_stirrup_envelope(text: str) -> _StirrupEnvelope | None:
     outer = _STIRRUP_OUTER_TAG_RE.match(text)
     if outer is None or not _is_single_stirrup_element(text, outer.group(1)):
         return None
-    if _is_verbatim_stirrup_envelope(text):
-        return _StirrupEnvelope(head=text, payload=None, tail="")
     shell_head = _STIRRUP_SHELL_HEAD_RE.match(text)
     if shell_head is not None and text.endswith(_STIRRUP_SHELL_END):
         # The first boundary wins: stdout may quote the markers, but stderr must
@@ -1273,7 +1274,29 @@ def _split_stirrup_envelope(text: str) -> _StirrupEnvelope | None:
                     payload=text[len(_STIRRUP_SUB_AGENT_HEAD) : -len(tail)],
                     tail=tail,
                 )
-    return None
+    error_head = _STIRRUP_SHELL_ERROR_HEAD_RE.match(text)
+    if error_head is not None:
+        if text.endswith(_STIRRUP_SHELL_ADVICE_END):
+            boundary = text.find(_STIRRUP_SHELL_ADVICE_BOUNDARY, error_head.end())
+            advice_end = len(text) - len(_STIRRUP_SHELL_ADVICE_END)
+            if 0 <= boundary <= advice_end - len(_STIRRUP_SHELL_ADVICE_BOUNDARY):
+                return _StirrupEnvelope(
+                    head=text[: error_head.end()],
+                    payload=text[error_head.end() : boundary],
+                    tail=text[boundary:],
+                )
+            return None
+        return _split_between(text, error_head.group(), _STIRRUP_SHELL_ERROR_TAIL)
+    fetch_head = _STIRRUP_WEB_FETCH_HEAD_RE.match(text)
+    if fetch_head is not None:
+        return _split_between(text, fetch_head.group(), f"</{fetch_head.group(1)}></web_fetch>")
+    # Only Stirrup's result list, so another tool's <results> output isn't unwrapped.
+    if text == _STIRRUP_SEARCH_HEAD + _STIRRUP_SEARCH_TAIL or (
+        text.startswith(_STIRRUP_SEARCH_HEAD + "<result>\n<title>")
+        and text.endswith("\n</result>" + _STIRRUP_SEARCH_TAIL)
+    ):
+        return _split_between(text, _STIRRUP_SEARCH_HEAD, _STIRRUP_SEARCH_TAIL)
+    return _split_between(text, _STIRRUP_SUB_AGENT_ERROR_HEAD, _STIRRUP_SUB_AGENT_ERROR_TAIL)
 
 
 # Splitting a layer rescans everything inside it, so peeling is bounded to keep
@@ -1285,8 +1308,8 @@ def _peel_stirrup_envelopes(text: str) -> _StirrupEnvelope | None:
     """Peel nested whole-string Stirrup envelopes down to one payload, else ``None``.
 
     The head and tail join every layer's. The payload is ``None`` when the whole
-    string stays verbatim: an error or web result at any layer, a blank payload,
-    or nesting deeper than ``_STIRRUP_MAX_NESTING``.
+    string stays verbatim: a blank payload at any layer, or nesting deeper than
+    ``_STIRRUP_MAX_NESTING``.
     """
     layer = _split_stirrup_envelope(text)
     if layer is None:

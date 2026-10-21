@@ -2401,6 +2401,24 @@ _STIRRUP_PAYLOAD_ENVELOPES = {
         "<sub_agent_result>\n<response>",
         "</response>\n<finished>True</finished>\n</sub_agent_result>",
     ),
+    "shell_error": (
+        "<shell_results>\n<error_kind>timeout</error_kind>\n<details>",
+        "</details>\n</shell_results>",
+    ),
+    "shell_error_with_advice": (
+        "<shell_results>\n<error_kind>invalid_argument</error_kind>\n<details>",
+        "</details>\n<advice>Quote the path.</advice>\n</shell_results>",
+    ),
+    "web_fetch": ("<web_fetch><url>https://example.test/page</url><body>", "</body></web_fetch>"),
+    "web_fetch_url_with_angle_bracket": (
+        "<web_fetch><url>https://example.test/search?q=1<2</url><body>",
+        "</body></web_fetch>",
+    ),
+    "web_fetch_error": (
+        "<web_fetch><url>https://example.test/page</url><error>",
+        "</error></web_fetch>",
+    ),
+    "sub_agent_error": ("<sub_agent_result>\n<error>", "</error>\n</sub_agent_result>"),
 }
 _STIRRUP_JSON_ROWS = json.dumps(
     [
@@ -2521,56 +2539,32 @@ def test_stirrup_stdout_that_quotes_the_markers_keeps_stderr_byte_exact() -> Non
     # be compressed as if it were stdout.
     assert result.compressed.endswith(text[text.index("</stdout>\n<stderr>") :])
     assert result.compressed.startswith("<shell_results>\n<exit_code>0</exit_code>\n<stdout>")
+    assert len(result.compressed) < len(text)
 
 
-def test_stirrup_envelope_with_empty_stdout_passes_through() -> None:
-    text = _stirrup_shell("", stderr="fatal: not a git repository")
+def test_stirrup_error_details_that_quote_the_markers_keep_the_advice_byte_exact() -> None:
+    head = "<shell_results>\n<error_kind>timeout</error_kind>\n<details>"
+    details = _STIRRUP_JSON_ROWS + "\necho '</details>\n<advice>'\n" + _STIRRUP_JSON_ROWS
+    text = f"{head}{details}</details>\n<advice>Raise the timeout.</advice>\n</shell_results>"
 
     result = ContentRouter().compress(text)
 
-    assert result.compressed == text
-    assert result.strategy_used is CompressionStrategy.PASSTHROUGH
+    assert result.compressed.endswith(text[text.index("</details>\n<advice>") :])
+    assert result.compressed.startswith(head)
+    assert len(result.compressed) < len(text)
 
 
-_STIRRUP_SEARCH_RESULTS = (
-    "<results>\n"
-    + "\n".join(
-        f"<result>\n<title>Result {i}</title>\n<url>https://example.test/{i}</url>"
-        f"\n<description>{'matching description words ' * 12}</description>\n</result>"
-        for i in range(30)
-    )
-    + "\n</results>"
-)
-
-
-@pytest.mark.parametrize("compress_tagged_content", [False, True])
 @pytest.mark.parametrize(
     "text",
     [
-        "<shell_results>\n<error_kind>timeout</error_kind>"
-        f"\n<details>{_STIRRUP_JSON_ROWS}</details>\n</shell_results>",
-        "<shell_results>\n<error_kind>invalid_argument</error_kind>"
-        f"\n<details>{_STIRRUP_JSON_ROWS}</details>\n<advice>Quote the path.</advice>"
-        "\n</shell_results>",
-        "<web_fetch><url>https://example.test/page</url>"
-        f"<body>{_STIRRUP_JSON_ROWS}</body></web_fetch>",
-        "<web_fetch><url>https://example.test/page</url>"
-        f"<error>{_STIRRUP_JSON_ROWS}</error></web_fetch>",
-        f"<sub_agent_result>\n<error>{_STIRRUP_JSON_ROWS}</error>\n</sub_agent_result>",
-        _STIRRUP_SEARCH_RESULTS,
+        _stirrup_shell("", stderr="fatal: not a git repository"),
+        *(head + tail for head, tail in _STIRRUP_PAYLOAD_ENVELOPES.values()),
         "<results>\n\n</results>",
     ],
-    ids=[
-        "shell_error",
-        "shell_error_with_advice",
-        "web_fetch",
-        "web_fetch_error",
-        "sub_agent_error",
-        "web_search",
-        "web_search_empty",
-    ],
+    ids=["shell_results_with_stderr", *_STIRRUP_PAYLOAD_ENVELOPES, "web_search"],
 )
-def test_stirrup_error_and_web_envelopes_stay_verbatim(
+@pytest.mark.parametrize("compress_tagged_content", [False, True])
+def test_stirrup_envelope_with_empty_payload_passes_through(
     text: str, compress_tagged_content: bool
 ) -> None:
     router = ContentRouter(ContentRouterConfig(compress_tagged_content=compress_tagged_content))
@@ -2579,6 +2573,34 @@ def test_stirrup_error_and_web_envelopes_stay_verbatim(
 
     assert result.compressed == text
     assert result.strategy_used is CompressionStrategy.PASSTHROUGH
+
+
+_STIRRUP_SEARCH_ITEMS = "\n".join(
+    f"<result>\n<title>Result {i}</title>\n<url>https://example.test/{i}</url>"
+    f"\n<description>{'matching description words ' * 12}</description>\n</result>"
+    for i in range(30)
+)
+
+
+@pytest.mark.parametrize("compress_tagged_content", [False, True])
+def test_stirrup_search_results_compress_like_the_bare_result_list(
+    compress_tagged_content: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Search results are prose, which only Kompress compresses, and tests don't load its model.
+    def keep_a_third(_self: ContentRouter, content: str, *_args: object, **_kwargs: object):
+        kept = content[: len(content) // 3]
+        return kept, _estimate_tokens(kept)
+
+    monkeypatch.setattr(ContentRouter, "_try_ml_compressor", keep_a_third)
+    config = ContentRouterConfig(compress_tagged_content=compress_tagged_content)
+    text = f"<results>\n{_STIRRUP_SEARCH_ITEMS}\n</results>"
+
+    bare = ContentRouter(config).compress(_STIRRUP_SEARCH_ITEMS)
+    wrapped = ContentRouter(config).compress(text)
+
+    assert len(bare.compressed) < len(_STIRRUP_SEARCH_ITEMS)
+    assert wrapped.compressed == f"<results>\n{bare.compressed}\n</results>"
+    assert wrapped.original == text
 
 
 _STIRRUP_WRAPPED_JSON = _stirrup_shell(_STIRRUP_JSON_ROWS)
@@ -2599,6 +2621,20 @@ def _adjacent_stirrup_envelopes(envelope: str) -> str:
         _adjacent_stirrup_envelopes("shell_results"),
         _adjacent_stirrup_envelopes("page_snapshot"),
         _adjacent_stirrup_envelopes("sub_agent_result"),
+        _adjacent_stirrup_envelopes("shell_error"),
+        _adjacent_stirrup_envelopes("shell_error_with_advice"),
+        _adjacent_stirrup_envelopes("web_fetch"),
+        _adjacent_stirrup_envelopes("web_fetch_error"),
+        _adjacent_stirrup_envelopes("sub_agent_error"),
+        "<shell_results>\n<error_kind>timeout</error_kind>\n<details>"
+        f"{_STIRRUP_JSON_ROWS}</detail>\n</shell_results>",
+        "<shell_results>\n<error_kind>timeout</error_kind>\n<details>"
+        f"{_STIRRUP_JSON_ROWS}</details>\n<advise>Quote the path.</advice>\n</shell_results>",
+        "<web_fetch><url>https://example.test/page</url><body>"
+        f"{_STIRRUP_JSON_ROWS}</error></web_fetch>",
+        "<web_fetch><url>https://example.test/page</url><error>"
+        f"{_STIRRUP_JSON_ROWS}</body></web_fetch>",
+        f"<results>\n{_STIRRUP_JSON_ROWS}\n</results>",
     ],
     ids=[
         "text_before",
@@ -2608,6 +2644,16 @@ def _adjacent_stirrup_envelopes(envelope: str) -> str:
         "adjacent_shell_results",
         "adjacent_page_snapshots",
         "adjacent_sub_agent_results",
+        "adjacent_shell_errors",
+        "adjacent_shell_errors_with_advice",
+        "adjacent_web_fetches",
+        "adjacent_web_fetch_errors",
+        "adjacent_sub_agent_errors",
+        "misspelled_details_close",
+        "misspelled_advice_open",
+        "web_fetch_body_closed_as_error",
+        "web_fetch_error_closed_as_body",
+        "results_that_are_not_search_results",
     ],
 )
 def test_text_that_merely_contains_a_stirrup_envelope_is_not_unwrapped(text: str) -> None:

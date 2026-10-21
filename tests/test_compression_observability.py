@@ -146,9 +146,11 @@ _STIRRUP_STDERR = "".join(f"warning: deprecated call in module_{i}\n" for i in r
         "<shell_results>\n<exit_code>0</exit_code>\n<stdout>"
         f"{_STIRRUP_ROWS}</stdout>\n<stderr>{_STIRRUP_STDERR}</stderr>\n</shell_results>",
         "<shell_results>\n<error_kind>timeout</error_kind>"
-        f"\n<details>{_STIRRUP_STDERR}</details>\n</shell_results>",
+        f"\n<details>{_STIRRUP_ROWS}</details>\n</shell_results>",
+        "<shell_results>\n<exit_code>1</exit_code>\n<stdout></stdout>"
+        f"\n<stderr>{_STIRRUP_STDERR}</stderr>\n</shell_results>",
     ],
-    ids=["compressed_stdout", "verbatim_error"],
+    ids=["compressed_stdout", "compressed_error", "verbatim_empty_stdout"],
 )
 def test_content_router_observer_counts_every_token_of_a_stirrup_result_once(content):
     spy = SpyObserver()
