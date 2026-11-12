@@ -1,0 +1,69 @@
+name: Codex code review
+
+# Codex reviews a pull request and posts the result as a new comment. This is
+# the pull request example from the openai/codex-action README, changed to run
+# Codex's /review against the base branch where the example sends a prompt.
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: github.event.pull_request.user.login != 'dependabot[bot]' && !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          # HEAD is GitHub's merge of the pull request into the base branch.
+          # Depth 2 adds the two commits it merges; HEAD^1 is the base one.
+          fetch-depth: 2
+
+      - name: Run Codex
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.CODE_REVIEW_OPENAI_API_KEY }}
+          allow-bot-users: ${{ secrets.CODE_REVIEW_ALLOWED_BOTS }}
+          permission-profile: ":workspace"
+          codex-args: '["review", "--base", "HEAD^1"]'
+          # The action starts Codex only when a prompt is set. Codex does not
+          # read it: with --base, /review writes its own request.
+          prompt: "unused"
+
+  post_feedback:
+    runs-on: ubuntu-latest
+    needs: review
+    if: needs.review.outputs.final_message != ''
+    permissions: {}
+    steps:
+      - name: Generate bot token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.CODEX_REVIEW_APP_ID }}
+          private-key: ${{ secrets.CODEX_REVIEW_PRIVATE_KEY }}
+
+      - name: Report Codex feedback
+        uses: actions/github-script@v9
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.review.outputs.final_message }}
+        with:
+          github-token: ${{ steps.bot-token.outputs.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: process.env.CODEX_FINAL_MESSAGE,
+            });
